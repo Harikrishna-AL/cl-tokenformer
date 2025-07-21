@@ -13,6 +13,14 @@ def count_parameters(model):
     """Counts the total number of parameters in a model."""
     return sum(p.numel() for p in model.parameters())
 
+def calculate_frozen_percentage(model):
+    """Calculates the percentage of frozen parameters in the model."""
+    total_params = count_parameters(model)
+    frozen_params = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+    if total_params == 0:
+        return 0
+    return (frozen_params / total_params) * 100
+
 def get_split_mnist_loaders(num_tasks, classes_per_task, batch_size):
     """ Prepares the Split MNIST dataloaders. """
     transform = transforms.Compose([
@@ -127,25 +135,31 @@ if __name__ == '__main__':
         print(f"\n--- Starting Training on Task {task_id} ---")
         
         # Freeze all previously trained parameters
-        for param in model.parameters():
-            param.requires_grad = False
+        # for param in model.parameters():
+        #     param.requires_grad = False
             
-        # Unfreeze the parameters for the current task's head
-        for param in model.mlp_heads[task_id].parameters():
-            param.requires_grad = True
+        # # Unfreeze the parameters for the current task's head
+        # for param in model.mlp_heads[task_id].parameters():
+        #     param.requires_grad = True
 
-        # Unfreeze the core model parameters ONLY for the first task
-        if task_id == 0:
-            for module in [model.to_patch_embedding, model.transformer]:
-                 for param in module.parameters():
-                    param.requires_grad = True
-            model.cls_token.requires_grad = True
-            model.pos_embedding.requires_grad = True
+        # # Unfreeze the core model parameters ONLY for the first task
+        # if task_id == 0:
+        #     for module in [model.to_patch_embedding, model.transformer]:
+        #          for param in module.parameters():
+        #             param.requires_grad = True
+        #     model.cls_token.requires_grad = True
+        #     model.pos_embedding.requires_grad = True
         
         # For subsequent tasks, only the new parts of grown Pattention layers are trainable
         # (This requires more complex parameter management, for now we train the head only)
         # A simple approach for this demo: only train the new head after task 0.
         # A more advanced approach would track new parameter tokens and only set them to requires_grad=True
+        if task_id == 0:
+            model.pos_embedding.requires_grad = True
+            model.cls_token.requires_grad = True
+            # The Pattention layers are trainable by default on task 0
+            for param in model.to_patch_embedding.parameters(): param.requires_grad = True
+            for param in model.transformer.parameters(): param.requires_grad = True
         
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         optimizer = torch.optim.Adam(trainable_params, lr=LR)
@@ -155,12 +169,21 @@ if __name__ == '__main__':
         print(f"--- Finished Training on Task {task_id} ---")
         evaluate(model, test_loaders, DEVICE, task_id + 1)
         print(f"Num model parameters: {count_parameters(model)}")
+        print(f'Percentage of frozen params: {calculate_frozen_percentage(model)}')
         
         # For this simplified demo, we won't grow the model to keep it runnable.
         # To implement the full paper's idea, you would call:
         if task_id < NUM_TASKS - 1:
+            for param in model.parameters():
+                param.requires_grad = False
             model.grow() 
         # And then manage which new parameters are trainable.
+
+        for param in model.mlp_heads[task_id].parameters():
+            param.requires_grad = True
+
+         # For the first task, also train the non-Pattention backbone components
+        
 
     # --- Final Evaluation ---
     print("\n--- Final Evaluation on All Tasks ---")

@@ -70,10 +70,14 @@ class PattentionLayer(nn.Module):
         new_key_tokens = torch.randn(num_new_tokens, dim_in, device=self.device)
         new_value_tokens = torch.randn(num_new_tokens, dim_out, device=self.device)
         
+        grad_mask = nn.ones
         # Concatenate new tokens to the existing ones
         self.key_param_tokens = nn.Parameter(torch.cat([self.key_param_tokens.data, new_key_tokens], dim=0))
         self.value_param_tokens = nn.Parameter(torch.cat([self.value_param_tokens.data, new_value_tokens], dim=0))
-        print(f"Grew Pattention layer. New total parameter tokens: {self.key_param_tokens.shape[0]}")
+
+        self.key_param_tokens[-1].requires_grad = False
+        self.value_param_tokens[-1].requires_grad = False
+        # print(f"Grew Pattention layer. New total parameter tokens: {self.key_param_tokens.shape[0]}")
 
 
 class TokenformerFeedForward(nn.Module):
