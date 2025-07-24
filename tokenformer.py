@@ -17,23 +17,9 @@ except ImportError:
     print("wandb not installed. Skipping W&B logging. To install: pip install wandb")
 
 
-
 def count_parameters(model):
     """Counts the total number of parameters in a model."""
     return sum(p.numel() for p in model.parameters())
-
-def calculate_frozen_percentage(model):
-    """Calculates the percentage of frozen parameters in the model."""
-    total_params = count_parameters(model)
-    frozen_params = sum(p.numel() for p in model.parameters() if not p.requires_grad)
-    if total_params == 0:
-        return 0
-    return (frozen_params / total_params) * 100
-
-def apply_grad_mask_hook(grad, mask):
-    """A gradient hook that applies a mask to the gradients."""
-    # print(grad.shape, mask.shape)
-    return grad * mask
 
 def get_split_mnist_loaders(num_tasks, classes_per_task, batch_size):
     """ Prepares the Split MNIST dataloaders. """
@@ -58,43 +44,12 @@ def get_split_mnist_loaders(num_tasks, classes_per_task, batch_size):
         print(f"Task {task_id}: Classes {task_classes}, Train samples {len(train_subset)}, Test samples {len(test_subset)}")
     return train_loaders, test_loaders
 
-def train_task(model, task_id, train_loader, optimizer, criterion, device, epochs, classes_per_task, global_step):
-    """ Trains the model on a single task. """
-    model.train()
-    start_class = task_id * classes_per_task
-    for epoch in range(epochs):
-        loop = tqdm(train_loader, leave=True)
-        for batch_idx, (data, target) in enumerate(loop):
-            data, target = data.to(device), target.to(device)
-            target = target - start_class
-            optimizer.zero_grad()
-            output = model(data, task_id)
-            loss = criterion(output, target)
-            
-            # --- Logging to W&B ---
-            if WANDB_AVAILABLE:
-                perplexity = torch.exp(loss)
-                wandb.log({
-                    "loss": loss.item(),
-                    "perplexity": perplexity.item(),
-                    "task_id": task_id,
-                    "epoch": epoch,
-                    "global_step": global_step
-                })
-            
-            loss.backward()
-            optimizer.step()
-            global_step += 1
-            loop.set_description(f"Task {task_id} Epoch {epoch+1}/{epochs}")
-            loop.set_postfix(loss=loss.item())
-    return global_step
-
-def evaluate(model, test_loaders, device, num_tasks, classes_per_task):
-    """ Evaluates the model on all seen tasks. """
+def evaluate(model, test_loaders, device, num_tasks_seen, classes_per_task):
+    """ Evaluates the model on all seen tasks and returns a list of accuracies. """
     model.eval()
     accuracies = []
     with torch.no_grad():
-        for task_id in range(num_tasks):
+        for task_id in range(num_tasks_seen):
             correct, total = 0, 0
             start_class = task_id * classes_per_task
             for data, target in test_loaders[task_id]:
@@ -109,85 +64,217 @@ def evaluate(model, test_loaders, device, num_tasks, classes_per_task):
             print(f"Accuracy on Task {task_id}: {accuracy:.2f}%")
     return accuracies
 
+### NEW/MODIFIED ###
+def apply_grad_mask_hook(grad, mask):
+    """A gradient hook that applies a mask to the gradients."""
+    return grad * mask
+
+def apply_masks_and_hooks(model, current_task_id, previous_handles):
+    """Removes old hooks and applies new ones for the current task."""
+    # Remove any hooks from the previous iteration for a clean state
+    for handle in previous_handles:
+        handle.remove()
+    
+    new_handles = []
+    
+    # Freeze parameters of previously learned tasks by masking gradients
+    for module in model.modules():
+        if isinstance(module, PattentionLayer):
+            new_handles.append(module.key_param_tokens.register_hook(
+                lambda grad, m=module: apply_grad_mask_hook(grad, m.key_grad_mask)
+            ))
+            new_handles.append(module.value_param_tokens.register_hook(
+                lambda grad, m=module: apply_grad_mask_hook(grad, m.value_grad_mask)
+            ))
+
+    # For other shared parameters, freeze them after the first task
+    if current_task_id > 0:
+        new_handles.append(model.pos_embedding.register_hook(lambda grad: grad * 0))
+        new_handles.append(model.cls_token.register_hook(lambda grad: grad * 0))
+        for name, param in model.named_parameters():
+            # Freeze normalization layers and patch embedding projection
+            if 'transformer' in name and 'norm' in name:
+                 new_handles.append(param.register_hook(lambda grad: grad * 0))
+            if 'to_patch_embedding' in name and not 'weight' in name and not 'bias' in name:
+                 new_handles.append(param.register_hook(lambda grad: grad * 0))
+    return new_handles
+
+
+def train_and_grow(model, current_task_id, train_loader, optimizer, criterion, device, epochs, 
+                   classes_per_task, global_step, ema_perplexity, config):
+    """
+    Trains the model and dynamically grows it based on perplexity spikes.
+    """
+    model.train()
+    
+    hook_handles = apply_masks_and_hooks(model, current_task_id, [])
+
+    for epoch in range(epochs):
+        loop = tqdm(train_loader, leave=True)
+        growth_triggered_in_epoch = False
+
+        for batch_idx, (data, target) in enumerate(loop):
+            # --- Perplexity-based Growth Check ---
+            if not growth_triggered_in_epoch and current_task_id < model.num_tasks - 1:
+                with torch.no_grad():
+                    output_check = model(data.to(device), current_task_id)
+                    
+                    ### CORRECTED LINE ###
+                    # The original target from the loader for the new task must be adjusted
+                    # before being used in the loss function.
+                    target_check = target.to(device)
+                    target_check = target_check % 2
+
+                    loss_check = criterion(output_check, target_check)
+                    perplexity = torch.exp(loss_check).item()
+
+                with torch.no_grad():
+                    output_check = model(data.to(device), current_task_id)
+                    
+                    if torch.max(target) >= (current_task_id + 1) * classes_per_task:
+                        # New labels detected, so perplexity is "infinite". Grow the model.
+                        perplexity = float('inf') 
+                    else:
+                        # This case shouldn't be hit when new task data arrives, but is safe
+                        output_check = model(data.to(device), current_task_id)
+                        target_check = target.to(device) - current_task_id * classes_per_task
+                        loss_check = criterion(output_check, target_check)
+                        perplexity = torch.exp(loss_check).item()
+
+
+                if ema_perplexity is not None and perplexity > ema_perplexity * config["perplexity_growth_threshold"]:
+                    print(f"\n📈 Perplexity spike detected! Current: {perplexity:.2f}, EMA: {ema_perplexity:.2f}. Growing model...")
+                    growth_triggered_in_epoch = True
+                    current_task_id += 1
+                    
+                    model.grow()
+                    print(f"Parameters after growth: {count_parameters(model):,}")
+                    
+                    optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"])
+                    hook_handles = apply_masks_and_hooks(model, current_task_id, hook_handles)
+                    # Don't reset EMA to infinity, start it fresh from the next batch's perplexity
+                    if perplexity == float('inf'):
+                        ema_perplexity = None
+                    else:
+                         ema_perplexity = perplexity
+                    
+                    if WANDB_AVAILABLE: wandb.log({"growth_event": 1, "global_step": global_step})
+
+
+            # --- Regular Training Step ---
+            data, target = data.to(device), target.to(device)
+            target = target - current_task_id * classes_per_task
+            
+            optimizer.zero_grad()
+            output = model(data, current_task_id)
+            loss = criterion(output, target)
+            loss.backward()
+            optimizer.step()
+            
+            # --- Update EMA Perplexity ---
+            current_perplexity = torch.exp(loss).item()
+            if ema_perplexity is None:
+                ema_perplexity = current_perplexity
+            else:
+                ema_perplexity = config["ema_alpha"] * current_perplexity + (1 - config["ema_alpha"]) * ema_perplexity
+
+            # --- Logging ---
+            global_step += 1
+            if WANDB_AVAILABLE:
+                wandb.log({
+                    "loss": loss.item(),
+                    "perplexity": current_perplexity,
+                    "ema_perplexity": ema_perplexity,
+                    "model_task_id": current_task_id,
+                    "epoch": epoch,
+                    "global_step": global_step
+                })
+            
+            loop.set_description(f"Data Task {config['data_task_idx']} | Model Task {current_task_id} | Epoch {epoch+1}/{epochs}")
+            loop.set_postfix(loss=loss.item(), perplexity=f"{current_perplexity:.2f}", ema_perp=f"{ema_perplexity:.2f}")
+
+    for handle in hook_handles:
+        handle.remove()
+        
+    return current_task_id, optimizer, global_step, ema_perplexity
+
+
 if __name__ == '__main__':
     # --- Hyperparameters ---
-    NUM_TASKS = 5
-    CLASSES_PER_TASK = 2
-    BATCH_SIZE = 64
-    EPOCHS_PER_TASK = 3
-    LR = 1e-4
+    config = {
+        "num_tasks": 5,
+        "classes_per_task": 2,
+        "batch_size": 64,
+        "epochs_per_task": 3,
+        "lr": 1e-4,
+        "perplexity_growth_threshold": 3.0, # ### NEW ### Grow if perplexity is 3x the EMA
+        "ema_alpha": 0.1, # ### NEW ### Smoothing factor for EMA
+        "data_task_idx": 0 # For logging purposes
+    }
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
     # --- W&B Initialization ---
     if WANDB_AVAILABLE:
         wandb.init(
-            project="tokenformer-split-mnist",
+            project="tokenformer-split-mnist-dynamic",
             config={
-                "learning_rate": LR,
-                "epochs_per_task": EPOCHS_PER_TASK,
-                "batch_size": BATCH_SIZE,
-                "architecture": "TokenformerViT-Grow-Mask",
+                "learning_rate": config["lr"],
+                "epochs_per_task": config["epochs_per_task"],
+                "batch_size": config["batch_size"],
+                "architecture": "TokenformerViT-Dynamic-Grow",
                 "dataset": "SplitMNIST",
+                "perplexity_growth_threshold": config["perplexity_growth_threshold"],
+                "ema_alpha": config["ema_alpha"]
             }
         )
 
     # --- Model Configuration ---
     model = TokenformerViT(
-        image_size=28, patch_size=7, num_tasks=NUM_TASKS, classes_per_task=CLASSES_PER_TASK,
+        image_size=28, patch_size=7, num_tasks=config["num_tasks"], classes_per_task=config["classes_per_task"],
         channels=1, dim=128, depth=2, heads=4, mlp_dim=256, dropout=0.1, emb_dropout=0.1, device=DEVICE
     ).to(DEVICE)
 
-    train_loaders, test_loaders = get_split_mnist_loaders(NUM_TASKS, CLASSES_PER_TASK, BATCH_SIZE)
+    train_loaders, test_loaders = get_split_mnist_loaders(config["num_tasks"], config["classes_per_task"], config["batch_size"])
     criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"])
 
     # --- Main Continual Learning Loop ---
-    hook_handles = []
     global_step = 0
-    for task_id in range(NUM_TASKS):
-        print(f"\n--- Starting Training on Task {task_id} ---")
-        print(f"Parameters before growth: {count_parameters(model):,}")
+    current_task_id = 0 # This is the model's internal task id, which will be incremented on growth
+    ema_perplexity = None # Initialize EMA tracker
 
-        # Remove any hooks from the previous iteration for a clean state
-        for handle in hook_handles:
-            handle.remove()
-        hook_handles = []
+    print(f"Initial model parameters: {count_parameters(model):,}")
 
-        if task_id > 0:
-            model.grow()
-            print(f"Parameters after growth: {count_parameters(model):,}")
+    for data_task_idx, train_loader in enumerate(train_loaders):
+        print(f"\n--- Presenting Data from Task {data_task_idx} ---")
+        config["data_task_idx"] = data_task_idx # Update for logging
 
-        # --- Register gradient masking hooks ---
-        for module in model.modules():
-            if isinstance(module, PattentionLayer):
-                hook_handles.append(module.key_param_tokens.register_hook(
-                    lambda grad, m=module: apply_grad_mask_hook(grad, m.key_grad_mask)
-                ))
-                hook_handles.append(module.value_param_tokens.register_hook(
-                    lambda grad, m=module: apply_grad_mask_hook(grad, m.value_grad_mask)
-                ))
-
-        # For non-Pattention parameters, freeze them after the first task
-        if task_id > 0:
-            hook_handles.append(model.pos_embedding.register_hook(lambda grad: grad * 0))
-            hook_handles.append(model.cls_token.register_hook(lambda grad: grad * 0))
-            for name, param in model.named_parameters():
-                if 'transformer' in name and 'norm' in name:
-                     hook_handles.append(param.register_hook(lambda grad: grad * 0))
-                if 'to_patch_embedding' in name and 'norm' in name:
-                     hook_handles.append(param.register_hook(lambda grad: grad * 0))
-
-        optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-
-        global_step = train_task(model, task_id, train_loaders[task_id], optimizer, criterion, DEVICE, EPOCHS_PER_TASK, CLASSES_PER_TASK, global_step)
+        current_task_id, optimizer, global_step, ema_perplexity = train_and_grow(
+            model, current_task_id, train_loader, optimizer, criterion, DEVICE, 
+            config["epochs_per_task"], config["classes_per_task"], global_step, ema_perplexity, config
+        )
         
-        print(f"--- Finished Training on Task {task_id} ---")
-        evaluate(model, test_loaders, DEVICE, task_id + 1, CLASSES_PER_TASK)
+        print(f"--- Finished Training on Data Task {data_task_idx} ---")
+        # Evaluate on all tasks seen so far by the model
+        accuracies = evaluate(model, test_loaders, DEVICE, current_task_id + 1, config["classes_per_task"])
+        
+        # ### MODIFIED ###: Calculate and log the average accuracy
+        avg_accuracy = np.mean(accuracies)
+        print(f"📊 Average Accuracy across {len(accuracies)} seen tasks: {avg_accuracy:.2f}%")
+        if WANDB_AVAILABLE:
+            wandb.log({
+                "average_accuracy": avg_accuracy,
+                "global_step": global_step
+            })
 
     # --- Final Evaluation ---
     print("\n--- Final Evaluation on All Tasks ---")
-    final_accuracies = evaluate(model, test_loaders, DEVICE, NUM_TASKS, CLASSES_PER_TASK)
+    final_accuracies = evaluate(model, test_loaders, DEVICE, config["num_tasks"], config["classes_per_task"])
     print(f"\nFinal model parameters: {count_parameters(model):,}")
     print(f"Average Accuracy: {np.mean(final_accuracies):.2f}%")
 
     if WANDB_AVAILABLE:
+        # Log the final average accuracy as a summary metric
+        wandb.summary["final_average_accuracy"] = np.mean(final_accuracies)
+        wandb.summary["final_model_parameters"] = count_parameters(model)
         wandb.finish()
