@@ -52,6 +52,7 @@ class PattentionLayer(nn.Module):
         similarity = torch.matmul(x, self.key_param_tokens.T) * self.scale
         norm_similarity = F.normalize(similarity, p=2, dim=-1)
         attn_weights = F.gelu(norm_similarity)
+        self.attn_weights = attn_weights
         out = torch.matmul(attn_weights, self.value_param_tokens)
         return out
 

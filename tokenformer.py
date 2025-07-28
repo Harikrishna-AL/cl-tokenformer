@@ -1,12 +1,13 @@
 import torch
 import torch.nn as nn
-from vit_pytorch import ViT, TokenformerViT, PattentionLayer
+from vit_pytorch import TokenformerViT, PattentionLayer
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 from torchvision.datasets import MNIST
 from torchvision import transforms
 from tqdm import tqdm
 import numpy as np
+import matplotlib.pyplot as plt
 
 # Try to import wandb
 try:
@@ -64,20 +65,17 @@ def evaluate(model, test_loaders, device, num_tasks_seen, classes_per_task):
             print(f"Accuracy on Task {task_id}: {accuracy:.2f}%")
     return accuracies
 
-### NEW/MODIFIED ###
 def apply_grad_mask_hook(grad, mask):
     """A gradient hook that applies a mask to the gradients."""
     return grad * mask
 
 def apply_masks_and_hooks(model, current_task_id, previous_handles):
     """Removes old hooks and applies new ones for the current task."""
-    # Remove any hooks from the previous iteration for a clean state
     for handle in previous_handles:
         handle.remove()
     
     new_handles = []
     
-    # Freeze parameters of previously learned tasks by masking gradients
     for module in model.modules():
         if isinstance(module, PattentionLayer):
             new_handles.append(module.key_param_tokens.register_hook(
@@ -87,80 +85,44 @@ def apply_masks_and_hooks(model, current_task_id, previous_handles):
                 lambda grad, m=module: apply_grad_mask_hook(grad, m.value_grad_mask)
             ))
 
-    # For other shared parameters, freeze them after the first task
     if current_task_id > 0:
         new_handles.append(model.pos_embedding.register_hook(lambda grad: grad * 0))
         new_handles.append(model.cls_token.register_hook(lambda grad: grad * 0))
         for name, param in model.named_parameters():
-            # Freeze normalization layers and patch embedding projection
             if 'transformer' in name and 'norm' in name:
-                 new_handles.append(param.register_hook(lambda grad: grad * 0))
+                new_handles.append(param.register_hook(lambda grad: grad * 0))
             if 'to_patch_embedding' in name and not 'weight' in name and not 'bias' in name:
-                 new_handles.append(param.register_hook(lambda grad: grad * 0))
+                new_handles.append(param.register_hook(lambda grad: grad * 0))
     return new_handles
 
 
-def train_and_grow(model, current_task_id, train_loader, optimizer, criterion, device, epochs, 
-                   classes_per_task, global_step, ema_perplexity, config):
+### MODIFIED FUNCTION ###
+def train_until_plateau(model, current_task_id, train_loader, optimizer, criterion, device,
+                        classes_per_task, global_step, ema_perplexity, config):
     """
-    Trains the model and dynamically grows it based on perplexity spikes.
+    Trains the model on a single task's data until the loss plateaus.
     """
     model.train()
     
+    # Apply gradient masks/hooks for the current task
     hook_handles = apply_masks_and_hooks(model, current_task_id, [])
 
-    for epoch in range(epochs):
+    # Plateau detection parameters from config
+    patience = config["patience"]
+    min_delta = config["min_delta_loss"]
+    
+    patience_counter = 0
+    best_loss = float('inf')
+    epoch = 0
+
+    print(f"🚀 Starting training for model task {current_task_id} until plateau (patience={patience}).")
+
+    while patience_counter < patience:
         loop = tqdm(train_loader, leave=True)
-        growth_triggered_in_epoch = False
-
+        epoch_loss = 0.
+        num_batches = 0
+        
         for batch_idx, (data, target) in enumerate(loop):
-            # --- Perplexity-based Growth Check ---
-            if not growth_triggered_in_epoch and current_task_id < model.num_tasks - 1:
-                with torch.no_grad():
-                    output_check = model(data.to(device), current_task_id)
-                    
-                    ### CORRECTED LINE ###
-                    # The original target from the loader for the new task must be adjusted
-                    # before being used in the loss function.
-                    target_check = target.to(device)
-                    target_check = target_check % 2
-
-                    loss_check = criterion(output_check, target_check)
-                    perplexity = torch.exp(loss_check).item()
-
-                with torch.no_grad():
-                    output_check = model(data.to(device), current_task_id)
-                    
-                    if torch.max(target) >= (current_task_id + 1) * classes_per_task:
-                        # New labels detected, so perplexity is "infinite". Grow the model.
-                        perplexity = float('inf') 
-                    else:
-                        # This case shouldn't be hit when new task data arrives, but is safe
-                        output_check = model(data.to(device), current_task_id)
-                        target_check = target.to(device) - current_task_id * classes_per_task
-                        loss_check = criterion(output_check, target_check)
-                        perplexity = torch.exp(loss_check).item()
-
-
-                if ema_perplexity is not None and perplexity > ema_perplexity * config["perplexity_growth_threshold"]:
-                    print(f"\n📈 Perplexity spike detected! Current: {perplexity:.2f}, EMA: {ema_perplexity:.2f}. Growing model...")
-                    growth_triggered_in_epoch = True
-                    current_task_id += 1
-                    
-                    model.grow()
-                    print(f"Parameters after growth: {count_parameters(model):,}")
-                    
-                    optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"])
-                    hook_handles = apply_masks_and_hooks(model, current_task_id, hook_handles)
-                    # Don't reset EMA to infinity, start it fresh from the next batch's perplexity
-                    if perplexity == float('inf'):
-                        ema_perplexity = None
-                    else:
-                         ema_perplexity = perplexity
-                    
-                    if WANDB_AVAILABLE: wandb.log({"growth_event": 1, "global_step": global_step})
-
-
             # --- Regular Training Step ---
             data, target = data.to(device), target.to(device)
             target = target - current_task_id * classes_per_task
@@ -170,6 +132,9 @@ def train_and_grow(model, current_task_id, train_loader, optimizer, criterion, d
             loss = criterion(output, target)
             loss.backward()
             optimizer.step()
+
+            epoch_loss += loss.item()
+            num_batches += 1
             
             # --- Update EMA Perplexity ---
             current_perplexity = torch.exp(loss).item()
@@ -182,21 +147,41 @@ def train_and_grow(model, current_task_id, train_loader, optimizer, criterion, d
             global_step += 1
             if WANDB_AVAILABLE:
                 wandb.log({
-                    "loss": loss.item(),
-                    "perplexity": current_perplexity,
-                    "ema_perplexity": ema_perplexity,
-                    "model_task_id": current_task_id,
-                    "epoch": epoch,
-                    "global_step": global_step
+                    "loss": loss.item(), "perplexity": current_perplexity,
+                    "ema_perplexity": ema_perplexity, "model_task_id": current_task_id,
+                    "epoch": epoch, "global_step": global_step
                 })
             
-            loop.set_description(f"Data Task {config['data_task_idx']} | Model Task {current_task_id} | Epoch {epoch+1}/{epochs}")
-            loop.set_postfix(loss=loss.item(), perplexity=f"{current_perplexity:.2f}", ema_perp=f"{ema_perplexity:.2f}")
+            loop.set_description(f"Data Task {config['data_task_idx']} | Model Task {current_task_id} | Epoch {epoch+1}")
+            loop.set_postfix(loss=loss.item(), avg_epoch_loss=f"{epoch_loss/num_batches:.4f}", patience=f"{patience_counter}/{patience}")
 
+        # --- Plateau Check at the end of a full data pass (epoch) ---
+        avg_epoch_loss = epoch_loss / num_batches
+        print(f"\nEpoch {epoch+1} ended. Avg Loss: {avg_epoch_loss:.4f}. Best Loss: {best_loss:.4f}")
+
+        if avg_epoch_loss < best_loss - min_delta:
+            best_loss = avg_epoch_loss
+            patience_counter = 0
+            print(f"✅ Loss improved. Resetting patience counter.")
+        else:
+            patience_counter += 1
+            print(f"⚠️ Loss did not improve. Patience: {patience_counter}/{patience}")
+        
+        if WANDB_AVAILABLE:
+            wandb.log({
+                "avg_epoch_loss": avg_epoch_loss, "best_epoch_loss": best_loss,
+                "patience_counter": patience_counter, "global_step": global_step
+            })
+        
+        epoch += 1
+    
+    print(f"🏁 Loss plateaued after {epoch} epochs. Finished training for model task {current_task_id}.")
+
+    # Clean up hooks after training for this task is done
     for handle in hook_handles:
         handle.remove()
         
-    return current_task_id, optimizer, global_step, ema_perplexity
+    return optimizer, global_step, ema_perplexity
 
 
 if __name__ == '__main__':
@@ -205,23 +190,25 @@ if __name__ == '__main__':
         "num_tasks": 5,
         "classes_per_task": 2,
         "batch_size": 64,
-        "epochs_per_task": 3,
+        "patience": 3,                      # ### NEW ### Stop after 3 full epochs with no improvement
+        "min_delta_loss": 0.005,            # ### NEW ### Min change in loss to be an improvement
         "lr": 1e-4,
-        "perplexity_growth_threshold": 3.0, # ### NEW ### Grow if perplexity is 3x the EMA
-        "ema_alpha": 0.1, # ### NEW ### Smoothing factor for EMA
-        "data_task_idx": 0 # For logging purposes
+        "perplexity_growth_threshold": 3.0,
+        "ema_alpha": 0.1,
+        "data_task_idx": 0
     }
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
     # --- W&B Initialization ---
     if WANDB_AVAILABLE:
         wandb.init(
-            project="tokenformer-split-mnist-dynamic",
+            project="tokenformer-split-mnist-plateau",
             config={
                 "learning_rate": config["lr"],
-                "epochs_per_task": config["epochs_per_task"],
+                "patience": config["patience"],
+                "min_delta_loss": config["min_delta_loss"],
                 "batch_size": config["batch_size"],
-                "architecture": "TokenformerViT-Dynamic-Grow",
+                "architecture": "TokenformerViT-Plateau-Grow",
                 "dataset": "SplitMNIST",
                 "perplexity_growth_threshold": config["perplexity_growth_threshold"],
                 "ema_alpha": config["ema_alpha"]
@@ -246,19 +233,40 @@ if __name__ == '__main__':
     print(f"Initial model parameters: {count_parameters(model):,}")
 
     for data_task_idx, train_loader in enumerate(train_loaders):
-        print(f"\n--- Presenting Data from Task {data_task_idx} ---")
-        config["data_task_idx"] = data_task_idx # Update for logging
+        print(f"\n--- Presenting Data from Task {data_task_idx} (Model is on Task {current_task_id}) ---")
+        config["data_task_idx"] = data_task_idx
 
-        current_task_id, optimizer, global_step, ema_perplexity = train_and_grow(
+        ### MODIFIED: Growth check is performed before starting training for a new task ###
+        if data_task_idx > 0:
+            first_batch_data, first_batch_target = next(iter(train_loader))
+            
+            # The most reliable signal for growth in Split-MNIST is detecting new class labels
+            if torch.max(first_batch_target) >= (current_task_id + 1) * config["classes_per_task"]:
+                print(f"🔎 New class labels detected. Growth condition met!")
+                current_task_id += 1
+                
+                model.grow()
+                print(f"Parameters after growth: {count_parameters(model):,}")
+                
+                # Optimizer must be re-initialized to include new parameters
+                optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"])
+                # Reset EMA perplexity as the model and data distribution have changed
+                ema_perplexity = None
+                
+                if WANDB_AVAILABLE:
+                    wandb.log({"growth_event": 1, "model_task_id": current_task_id, "global_step": global_step})
+                    wandb.log({"model_parameters": count_parameters(model), "global_step": global_step})
+
+        # --- Train on the current task's data until loss plateaus ---
+        optimizer, global_step, ema_perplexity = train_until_plateau(
             model, current_task_id, train_loader, optimizer, criterion, DEVICE, 
-            config["epochs_per_task"], config["classes_per_task"], global_step, ema_perplexity, config
+            config["classes_per_task"], global_step, ema_perplexity, config
         )
         
         print(f"--- Finished Training on Data Task {data_task_idx} ---")
         # Evaluate on all tasks seen so far by the model
         accuracies = evaluate(model, test_loaders, DEVICE, current_task_id + 1, config["classes_per_task"])
         
-        # ### MODIFIED ###: Calculate and log the average accuracy
         avg_accuracy = np.mean(accuracies)
         print(f"📊 Average Accuracy across {len(accuracies)} seen tasks: {avg_accuracy:.2f}%")
         if WANDB_AVAILABLE:
@@ -274,7 +282,6 @@ if __name__ == '__main__':
     print(f"Average Accuracy: {np.mean(final_accuracies):.2f}%")
 
     if WANDB_AVAILABLE:
-        # Log the final average accuracy as a summary metric
         wandb.summary["final_average_accuracy"] = np.mean(final_accuracies)
         wandb.summary["final_model_parameters"] = count_parameters(model)
         wandb.finish()
