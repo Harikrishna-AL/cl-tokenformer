@@ -1,3 +1,5 @@
+# tokenformer.py
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -43,6 +45,9 @@ class PattentionLayer(nn.Module):
         # Initialize gradient masks as buffers
         self.register_buffer('key_grad_mask', torch.ones_like(self.key_param_tokens))
         self.register_buffer('value_grad_mask', torch.ones_like(self.value_param_tokens))
+        
+        # ### NEW ###: Keep track of growth boundaries for orthogonality loss
+        self.growth_indices = []
 
 
     def forward(self, x):
@@ -64,6 +69,10 @@ class PattentionLayer(nn.Module):
         dim_in = self.key_param_tokens.shape[1]
         dim_out = self.value_param_tokens.shape[1]
         
+        # ### NEW ###: Store the number of old tokens as the growth boundary
+        num_old_tokens = self.key_param_tokens.shape[0]
+        self.growth_indices.append(num_old_tokens)
+        
         # --- Freeze existing parameters by setting their mask to 0 ---
         self.key_grad_mask.fill_(0)
         self.value_grad_mask.fill_(0)
@@ -83,7 +92,7 @@ class PattentionLayer(nn.Module):
         self.key_grad_mask = torch.cat([self.key_grad_mask, new_key_mask], dim=0)
         self.value_grad_mask = torch.cat([self.value_grad_mask, new_value_mask], dim=0)
 
-
+# ... (the rest of the file remains the same)
 class TokenformerFeedForward(nn.Module):
     def __init__(self, dim, hidden_dim, ffn_num_param_tokens, dropout = 0., device='cpu'):
         super().__init__()

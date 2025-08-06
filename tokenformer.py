@@ -1,6 +1,7 @@
+# tokenformer_inference.py
 import torch
 import torch.nn as nn
-from vit_pytorch import TokenformerViT, PattentionLayer
+from vit_pytorch import TokenformerViT, PattentionLayer # Make sure to import from your local file
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 from torchvision.datasets import MNIST
@@ -17,6 +18,7 @@ except ImportError:
     WANDB_AVAILABLE = False
     print("wandb not installed. Skipping W&B logging. To install: pip install wandb")
 
+# ... (get_split_mnist_loaders, evaluate, apply_grad_mask_hook, apply_masks_and_hooks functions remain the same) ...
 
 def count_parameters(model):
     """Counts the total number of parameters in a model."""
@@ -96,26 +98,55 @@ def apply_masks_and_hooks(model, current_task_id, previous_handles):
     return new_handles
 
 
+### NEW FUNCTION ###
+def calculate_orthogonality_loss(model):
+    """
+    Calculates the orthogonality loss for all Pattention layers in the model.
+    This loss encourages the newly added key parameters to be orthogonal to all previous key parameters.
+    """
+    ortho_loss = 0.0
+    for module in model.modules():
+        if isinstance(module, PattentionLayer) and module.growth_indices:
+            # This layer has grown at least once
+            
+            # The 'old' parameters are all parameters up to the last growth boundary
+            last_growth_idx = module.growth_indices[-1]
+            k_old = module.key_param_tokens[:last_growth_idx]
+            
+            # The 'new' parameters are those added during the last growth phase
+            k_new = module.key_param_tokens[last_growth_idx:]
+
+            # Calculate the dot product between old and new key subspaces
+            # We want this to be a zero matrix, so we penalize its norm
+            if k_old.numel() > 0 and k_new.numel() > 0:
+                dot_product_matrix = torch.matmul(k_old, k_new.T)
+                target_matrix = torch.zeros_like(dot_product_matrix)
+                # This is an AVERAGE of squares
+                ortho_loss += F.mse_loss(dot_product_matrix, target_matrix)
+
+    return ortho_loss
+
+
 ### MODIFIED FUNCTION ###
 def train_until_plateau(model, current_task_id, train_loader, optimizer, criterion, device,
                         classes_per_task, global_step, ema_perplexity, config):
     """
-    Trains the model on a single task's data until the loss plateaus.
+    Trains the model on a single task's data until the loss plateaus,
+    now including the orthogonality loss.
     """
     model.train()
     
-    # Apply gradient masks/hooks for the current task
     hook_handles = apply_masks_and_hooks(model, current_task_id, [])
 
-    # Plateau detection parameters from config
     patience = config["patience"]
     min_delta = config["min_delta_loss"]
+    lambda_ortho = config["lambda_ortho"] # Get lambda from config
     
     patience_counter = 0
     best_loss = float('inf')
     epoch = 0
 
-    print(f"🚀 Starting training for model task {current_task_id} until plateau (patience={patience}).")
+    print(f"🚀 Starting training for model task {current_task_id} until plateau (patience={patience}, lambda_ortho={lambda_ortho}).")
 
     while patience_counter < patience:
         loop = tqdm(train_loader, leave=True)
@@ -129,15 +160,25 @@ def train_until_plateau(model, current_task_id, train_loader, optimizer, criteri
             
             optimizer.zero_grad()
             output = model(data, current_task_id)
-            loss = criterion(output, target)
-            loss.backward()
+            
+            # --- Calculate Losses ---
+            task_loss = criterion(output, target)
+            ortho_loss = 0.0
+            
+            # Add orthogonality loss only for new tasks (after first growth)
+            if current_task_id > 0:
+                ortho_loss = calculate_orthogonality_loss(model)
+
+            total_loss = task_loss + lambda_ortho * ortho_loss
+            
+            total_loss.backward()
             optimizer.step()
 
-            epoch_loss += loss.item()
+            epoch_loss += total_loss.item()
             num_batches += 1
             
-            # --- Update EMA Perplexity ---
-            current_perplexity = torch.exp(loss).item()
+            # --- Update EMA Perplexity (based on task_loss) ---
+            current_perplexity = torch.exp(task_loss).item()
             if ema_perplexity is None:
                 ema_perplexity = current_perplexity
             else:
@@ -146,18 +187,21 @@ def train_until_plateau(model, current_task_id, train_loader, optimizer, criteri
             # --- Logging ---
             global_step += 1
             if WANDB_AVAILABLE:
-                wandb.log({
-                    "loss": loss.item(), "perplexity": current_perplexity,
-                    "ema_perplexity": ema_perplexity, "model_task_id": current_task_id,
-                    "epoch": epoch, "global_step": global_step
-                })
+                log_data = {
+                    "task_loss": task_loss.item(), "total_loss": total_loss.item(),
+                    "perplexity": current_perplexity, "ema_perplexity": ema_perplexity,
+                    "model_task_id": current_task_id, "epoch": epoch, "global_step": global_step
+                }
+                if current_task_id > 0:
+                    log_data["ortho_loss"] = ortho_loss.item() if isinstance(ortho_loss, torch.Tensor) else ortho_loss
+                wandb.log(log_data)
             
             loop.set_description(f"Data Task {config['data_task_idx']} | Model Task {current_task_id} | Epoch {epoch+1}")
-            loop.set_postfix(loss=loss.item(), avg_epoch_loss=f"{epoch_loss/num_batches:.4f}", patience=f"{patience_counter}/{patience}")
+            loop.set_postfix(loss=total_loss.item(), ortho=f"{ortho_loss.item() if isinstance(ortho_loss, torch.Tensor) else 0:.4f}", patience=f"{patience_counter}/{patience}")
 
-        # --- Plateau Check at the end of a full data pass (epoch) ---
+        # --- Plateau Check ---
         avg_epoch_loss = epoch_loss / num_batches
-        print(f"\nEpoch {epoch+1} ended. Avg Loss: {avg_epoch_loss:.4f}. Best Loss: {best_loss:.4f}")
+        print(f"\nEpoch {epoch+1} ended. Avg Total Loss: {avg_epoch_loss:.4f}. Best Loss: {best_loss:.4f}")
 
         if avg_epoch_loss < best_loss - min_delta:
             best_loss = avg_epoch_loss
@@ -176,8 +220,6 @@ def train_until_plateau(model, current_task_id, train_loader, optimizer, criteri
         epoch += 1
     
     print(f"🏁 Loss plateaued after {epoch} epochs. Finished training for model task {current_task_id}.")
-
-    # Clean up hooks after training for this task is done
     for handle in hook_handles:
         handle.remove()
         
@@ -190,9 +232,10 @@ if __name__ == '__main__':
         "num_tasks": 5,
         "classes_per_task": 2,
         "batch_size": 64,
-        "patience": 3,                      # ### NEW ### Stop after 3 full epochs with no improvement
-        "min_delta_loss": 0.005,            # ### NEW ### Min change in loss to be an improvement
+        "patience": 2,
+        "min_delta_loss": 0.01,
         "lr": 1e-4,
+        "lambda_ortho": 1e-4,  # ### NEW ###: Strength of the orthogonality constraint
         "perplexity_growth_threshold": 3.0,
         "ema_alpha": 0.1,
         "data_task_idx": 0
@@ -202,20 +245,21 @@ if __name__ == '__main__':
     # --- W&B Initialization ---
     if WANDB_AVAILABLE:
         wandb.init(
-            project="tokenformer-split-mnist-plateau",
+            project="tokenformer-split-mnist-ortho", # New project name
             config={
                 "learning_rate": config["lr"],
                 "patience": config["patience"],
                 "min_delta_loss": config["min_delta_loss"],
                 "batch_size": config["batch_size"],
-                "architecture": "TokenformerViT-Plateau-Grow",
+                "lambda_ortho": config["lambda_ortho"], # ### NEW ###
+                "architecture": "TokenformerViT-Ortho-Grow",
                 "dataset": "SplitMNIST",
                 "perplexity_growth_threshold": config["perplexity_growth_threshold"],
                 "ema_alpha": config["ema_alpha"]
             }
         )
 
-    # --- Model Configuration ---
+    # --- Model, Data, Optimizer, Criterion ---
     model = TokenformerViT(
         image_size=28, patch_size=7, num_tasks=config["num_tasks"], classes_per_task=config["classes_per_task"],
         channels=1, dim=128, depth=2, heads=4, mlp_dim=256, dropout=0.1, emb_dropout=0.1, device=DEVICE
@@ -226,6 +270,7 @@ if __name__ == '__main__':
     optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"])
 
     # --- Main Continual Learning Loop ---
+    # ... (The main loop remains exactly the same as your previous version) ...
     global_step = 0
     current_task_id = 0 # This is the model's internal task id, which will be incremented on growth
     ema_perplexity = None # Initialize EMA tracker

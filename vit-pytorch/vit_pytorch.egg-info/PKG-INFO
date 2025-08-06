@@ -1,4 +1,4 @@
-Metadata-Version: 2.1
+Metadata-Version: 2.4
 Name: vit-pytorch
 Version: 1.10.1
 Summary: Vision Transformer (ViT) - Pytorch
@@ -14,6 +14,20 @@ Classifier: License :: OSI Approved :: MIT License
 Classifier: Programming Language :: Python :: 3.6
 Description-Content-Type: text/markdown
 License-File: LICENSE
+Requires-Dist: einops>=0.7.0
+Requires-Dist: torch>=1.10
+Requires-Dist: torchvision
+Dynamic: author
+Dynamic: author-email
+Dynamic: classifier
+Dynamic: description
+Dynamic: description-content-type
+Dynamic: home-page
+Dynamic: keywords
+Dynamic: license
+Dynamic: license-file
+Dynamic: requires-dist
+Dynamic: summary
 
 <img src="./images/vit.gif" width="500px"></img>
 
