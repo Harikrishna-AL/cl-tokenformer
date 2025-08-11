@@ -3,57 +3,27 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
-from torchvision.datasets import MNIST
-from torchvision import transforms
+import torchvision.models as models
 
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
-from tqdm import tqdm
-import numpy as np
 
-# helpers
+# PattentionLayer, TokenformerAttention, TokenformerFeedForward, TokenformerEncoder
+# remain EXACTLY THE SAME as your previous version. They are the core building blocks.
 
-def pair(t):
-    """Helper function to ensure t is a tuple."""
-    return t if isinstance(t, tuple) else (t, t)
-
-def count_parameters(model):
-    """Counts the total number of parameters in a model."""
-    return sum(p.numel() for p in model.parameters())
-
-def apply_grad_mask_hook(grad, mask):
-    """A gradient hook that applies a mask to the gradients."""
-    return grad * mask
-
-# classes
-
+# ... (Paste PattentionLayer, TokenformerFeedForward, TokenformerAttention, TokenformerEncoder here) ...
 class PattentionLayer(nn.Module):
-    """
-    The core Token-Parameter Attention (Pattention) layer, modified to support growth
-    with gradient masks.
-    """
     def __init__(self, dim_in, dim_out, num_param_tokens, device='cpu'):
         super().__init__()
         self.scale = dim_in ** -0.5
         self.device = device
-
-        # Initialize parameters as a single tensor
         self.key_param_tokens = nn.Parameter(torch.randn(num_param_tokens, dim_in))
         self.value_param_tokens = nn.Parameter(torch.randn(num_param_tokens, dim_out))
-
-        # Initialize gradient masks as buffers
         self.register_buffer('key_grad_mask', torch.ones_like(self.key_param_tokens))
         self.register_buffer('value_grad_mask', torch.ones_like(self.value_param_tokens))
-        
-        # ### NEW ###: Keep track of growth boundaries for orthogonality loss
         self.growth_indices = []
 
-
     def forward(self, x):
-        """
-        Forward pass for Pattention.
-        """
         similarity = torch.matmul(x, self.key_param_tokens.T) * self.scale
         norm_similarity = F.normalize(similarity, p=2, dim=-1)
         attn_weights = F.gelu(norm_similarity)
@@ -62,37 +32,21 @@ class PattentionLayer(nn.Module):
         return out
 
     def grow(self, num_new_tokens):
-        """
-        Expands the layer by adding new parameter tokens and updating the gradient mask.
-        """
-        # Get dimensions and device from existing parameters
         dim_in = self.key_param_tokens.shape[1]
         dim_out = self.value_param_tokens.shape[1]
-        
-        # ### NEW ###: Store the number of old tokens as the growth boundary
         num_old_tokens = self.key_param_tokens.shape[0]
         self.growth_indices.append(num_old_tokens)
-        
-        # --- Freeze existing parameters by setting their mask to 0 ---
         self.key_grad_mask.fill_(0)
         self.value_grad_mask.fill_(0)
-
-        # --- Create new parameter tokens ---
-        new_key_tokens = torch.randn(num_new_tokens, dim_in, device=self.device)
-        new_value_tokens = torch.randn(num_new_tokens, dim_out, device=self.device)
-        
-        # --- Create masks for the new tokens ---
+        new_key_tokens = torch.randn(num_new_tokens, dim_in, device=self.device) * 0.01
+        new_value_tokens = torch.randn(num_new_tokens, dim_out, device=self.device) * 0.01
         new_key_mask = torch.ones_like(new_key_tokens)
         new_value_mask = torch.ones_like(new_value_tokens)
-
-        # --- Concatenate old and new parameters/masks ---
         self.key_param_tokens = nn.Parameter(torch.cat([self.key_param_tokens.data, new_key_tokens], dim=0))
         self.value_param_tokens = nn.Parameter(torch.cat([self.value_param_tokens.data, new_value_tokens], dim=0))
-        
         self.key_grad_mask = torch.cat([self.key_grad_mask, new_key_mask], dim=0)
         self.value_grad_mask = torch.cat([self.value_grad_mask, new_value_mask], dim=0)
 
-# ... (the rest of the file remains the same)
 class TokenformerFeedForward(nn.Module):
     def __init__(self, dim, hidden_dim, ffn_num_param_tokens, dropout = 0., device='cpu'):
         super().__init__()
@@ -117,10 +71,8 @@ class TokenformerAttention(nn.Module):
         self.norm = nn.LayerNorm(dim)
         self.attend = nn.Softmax(dim = -1)
         self.dropout = nn.Dropout(dropout)
-
         if attn_num_param_tokens is None:
             attn_num_param_tokens = inner_dim
-            
         self.to_q = PattentionLayer(dim, inner_dim, num_param_tokens=attn_num_param_tokens, device=device)
         self.to_k = PattentionLayer(dim, inner_dim, num_param_tokens=attn_num_param_tokens, device=device)
         self.to_v = PattentionLayer(dim, inner_dim, num_param_tokens=attn_num_param_tokens, device=device)
@@ -153,56 +105,75 @@ class TokenformerEncoder(nn.Module):
             x = ff(x) + x
         return self.norm(x)
 
-class TokenformerViT(nn.Module):
-    def __init__(self, *, image_size, patch_size, num_tasks, classes_per_task, dim, depth, heads, mlp_dim, pool = 'cls', channels = 3, dim_head = 64, dropout = 0., emb_dropout = 0., device='cpu'):
+### --- NEW ARCHITECTURE --- ###
+
+class GrowingTokenformer(nn.Module):
+    """
+    This module contains the part of the network that grows: the Tokenformer encoder
+    and the multi-head output layer. It operates on feature vectors, not images.
+    """
+    def __init__(self, *, dim, depth, heads, mlp_dim, num_tasks, classes_per_task, device='cpu'):
         super().__init__()
-        self.device = device
         self.dim = dim
         self.mlp_dim = mlp_dim
-        self.num_tasks = num_tasks
-        image_height, image_width = pair(image_size)
-        patch_height, patch_width = pair(patch_size)
-        assert image_height % patch_height == 0 and image_width % patch_width == 0, 'Image dimensions must be divisible by the patch size.'
-        num_patches = (image_height // patch_height) * (image_width // patch_width)
-        patch_dim = channels * patch_height * patch_width
-        assert pool in {'cls', 'mean'}, 'pool type must be either cls (cls token) or mean (mean pooling)'
-
-        self.to_patch_embedding = nn.Sequential(
-            Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1 = patch_height, p2 = patch_width),
-            nn.LayerNorm(patch_dim),
-            PattentionLayer(patch_dim, dim, num_param_tokens=dim, device=device),
-            nn.LayerNorm(dim),
-        )
-        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
-        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
-        self.dropout = nn.Dropout(emb_dropout)
-        self.transformer = TokenformerEncoder(dim, depth, heads, dim_head, mlp_dim, mlp_dim, dim, dropout, device=device)
-        self.pool = pool
-        self.to_latent = nn.Identity()
-
+        
+        # The Tokenformer encoder that will process feature vectors
+        self.transformer = TokenformerEncoder(dim, depth, heads, dim, mlp_dim, mlp_dim, dim, device=device)
+        
+        # The multi-head output layer that is selected by task_id
         self.mlp_heads = nn.ModuleList([
             PattentionLayer(dim, classes_per_task, num_param_tokens=classes_per_task * 4, device=device) for _ in range(num_tasks)
         ])
 
-    def forward(self, img, task_id):
-        x = self.to_patch_embedding(img)
-        b, n, _ = x.shape
-        cls_tokens = repeat(self.cls_token, '1 1 d -> b 1 d', b = b)
-        x = torch.cat((cls_tokens, x), dim=1)
-        x += self.pos_embedding[:, :(n + 1)]
-        x = self.dropout(x)
+    def forward(self, x, task_id):
+        # The encoder expects a sequence. We unsqueeze to add a dummy sequence dimension.
+        x = x.unsqueeze(1)
         x = self.transformer(x)
-        x = x.mean(dim = 1) if self.pool == 'mean' else x[:, 0]
-        x = self.to_latent(x)
+        # Squeeze back to a feature vector
+        x = x.squeeze(1)
         return self.mlp_heads[task_id](x)
 
-    def grow(self, ffn_growth_factor=2, attn_growth_factor=2):
-        """ Grows the entire model by expanding all Pattention layers. """
-        print("\n--- Growing Model ---")
-        ffn_new_tokens = self.mlp_dim // ffn_growth_factor
-        attn_new_tokens = self.dim // attn_growth_factor
+    def grow(self):
+        """ Grows the transformer by expanding its Pattention layers. """
+        # NOTE: Growth factors are now hardcoded for simplicity, could be passed in.
+        attn_new_tokens = self.dim // 2
 
-        for module in self.modules():
+        # We only grow the transformer, not the output heads
+        for module in self.transformer.modules():
             if isinstance(module, PattentionLayer):
-                 module.grow(attn_new_tokens)
+                module.grow(attn_new_tokens)
+
+class ContinualLearner(nn.Module):
+    """
+    The main model that combines a frozen backbone with the growing Tokenformer module.
+    """
+    def __init__(self, *, dim, depth, heads, mlp_dim, num_tasks, classes_per_task, device='cpu'):
+        super().__init__()
+        
+        # 1. Load and freeze the pretrained backbone (ResNet-18)
+        self.backbone = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        backbone_out_features = self.backbone.fc.in_features
+        self.backbone.fc = nn.Identity() # Remove the final classification layer
+
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+            
+        # 2. Adapter layer to match backbone output to tokenformer input dimension
+        self.adapter = nn.Linear(backbone_out_features, dim)
+        
+        # 3. The growing part of our model
+        self.growing_module = GrowingTokenformer(
+            dim=dim, depth=depth, heads=heads, mlp_dim=mlp_dim,
+            num_tasks=num_tasks, classes_per_task=classes_per_task, device=device
+        )
+        
+    def forward(self, img, task_id):
+        self.backbone.eval() # Ensure backbone is always in eval mode (for batchnorm)
+        features = self.backbone(img)
+        adapted_features = self.adapter(features)
+        return self.growing_module(adapted_features, task_id)
+
+    def grow(self):
+        print("\n--- Growing Model (Tokenformer Module) ---")
+        self.growing_module.grow()
         print("--- Model Growth Complete ---")
