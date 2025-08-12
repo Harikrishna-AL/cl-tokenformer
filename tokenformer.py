@@ -121,6 +121,7 @@ def train_until_plateau(model, current_task_id, train_loader, optimizer, criteri
     patience = config["patience"]
     min_delta = config["min_delta_loss"]
     # --- Lambda scheduling parameters ---
+    lambda_min = config["lambda_min"]
     lambda_max = config["lambda_max"]
     lambda_decay_epochs = config["lambda_decay_epochs"]
     
@@ -137,8 +138,9 @@ def train_until_plateau(model, current_task_id, train_loader, optimizer, criteri
         num_batches = 0
         
         # --- Calculate current lambda for this epoch ---
-        current_lambda = lambda_max * max(0, (1 - epoch / lambda_decay_epochs))
-        
+        decay_factor = max(0, (1 - epoch / lambda_decay_epochs))
+        current_lambda = lambda_min + (lambda_max - lambda_min) * decay_factor  
+
         for batch_idx, (data, target) in enumerate(loop):
             data, target = data.to(device), target.to(device)
             target = target - current_task_id * classes_per_task
@@ -212,8 +214,9 @@ if __name__ == '__main__':
         "patience": 2,
         "min_delta_loss": 0.01,
         "lr": 1e-4,
-        "lambda_max": 1.0, # Start with a strong orthogonality constraint
-        "lambda_decay_epochs": 4, # Decay lambda over 4 epochs
+        "lambda_max": 10.0, # Start with a strong orthogonality constraint
+        "lambda_min" : 2.5,
+        "lambda_decay_epochs": 10, # Decay lambda over 4 epochs
         "data_task_idx": 0
     }
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
