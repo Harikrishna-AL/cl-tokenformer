@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from vit_pytorch import ContinualLearner, PattentionLayer
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, TensorDataset, Dataset
 from torchvision.datasets import MNIST
 from torchvision import transforms
 from tqdm import tqdm
@@ -93,26 +93,84 @@ def count_parameters(model, trainable_only=False):
         return sum(p.numel() for p in model.parameters() if p.requires_grad)
     return sum(p.numel() for p in model.parameters())
 
-def get_split_mnist_loaders(num_tasks, classes_per_task, batch_size):
+def preprocess_mnist_to_disk(root='./data'):
+    """
+    Transforms and saves each MNIST image as a separate file.
+    This is a one-time, memory-safe operation.
+    """
+    preprocessed_dir = os.path.join(root, "mnist_preprocessed")
+    if os.path.exists(preprocessed_dir):
+        print(f"✔️ Preprocessed data found at {preprocessed_dir}")
+        return
+
+    print(f"⚠️ No preprocessed data found. Creating cache at {preprocessed_dir}...")
+    os.makedirs(preprocessed_dir, exist_ok=True)
+
     transform = transforms.Compose([
         transforms.Resize(224),
         transforms.Grayscale(num_output_channels=3),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
-    full_train_dataset = MNIST(root='./data', train=True, download=True, transform=transform)
-    full_test_dataset = MNIST(root='./data', train=False, download=True, transform=transform)
+
+    for split in ['train', 'test']:
+        is_train = (split == 'train')
+        raw_dataset = MNIST(root=root, train=is_train, download=True)
+        split_dir = os.path.join(preprocessed_dir, split)
+        os.makedirs(split_dir, exist_ok=True)
+        
+        for i, (img, label) in enumerate(tqdm(raw_dataset, desc=f"Preprocessing {split} set")):
+            transformed_img = transform(img)
+            save_path = os.path.join(split_dir, f"sample_{i}.pt")
+            torch.save((transformed_img, label), save_path)
+
+class PreprocessedMNIST(Dataset):
+    """
+    A custom Dataset class that loads pre-transformed tensors from disk.
+    Initialization is fast as it only scans for file paths.
+    """
+    def __init__(self, root='./data', train=True):
+        split = 'train' if train else 'test'
+        self.data_dir = os.path.join(root, "mnist_preprocessed", split)
+        self.samples = [os.path.join(self.data_dir, f) for f in os.listdir(self.data_dir) if f.endswith('.pt')]
+        
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        # Load one pre-transformed sample from disk
+        return torch.load(self.samples[index])
+
+def get_split_mnist_loaders(num_tasks, classes_per_task, batch_size):
+    """ Prepares Split MNIST dataloaders using the on-disk cache. """
+    # Ensure the on-disk cache exists, creating it if necessary
+    preprocess_mnist_to_disk()
+
+    # Load the custom datasets which point to the preprocessed files
+    full_train_dataset = PreprocessedMNIST(train=True)
+    full_test_dataset = PreprocessedMNIST(train=False)
+
+    # Get the original labels for splitting
+    raw_mnist_train = MNIST(root='./data', train=True, download=True)
+    raw_mnist_test = MNIST(root='./data', train=False, download=True)
+
     train_loaders, test_loaders = [], []
     for task_id in range(num_tasks):
         start_class = task_id * classes_per_task
         end_class = (task_id + 1) * classes_per_task
         task_classes = list(range(start_class, end_class))
-        train_indices = [i for i, (_, label) in enumerate(full_train_dataset) if label in task_classes]
-        test_indices = [i for i, (_, label) in enumerate(full_test_dataset) if label in task_classes]
-        train_subset, test_subset = Subset(full_train_dataset, train_indices), Subset(full_test_dataset, test_indices)
-        train_loaders.append(DataLoader(train_subset, batch_size=batch_size, shuffle=True))
-        test_loaders.append(DataLoader(test_subset, batch_size=batch_size, shuffle=False))
+        
+        # Find indices for the current task (this is fast)
+        train_indices = [i for i, label in enumerate(raw_mnist_train.targets) if label in task_classes]
+        test_indices = [i for i, label in enumerate(raw_mnist_test.targets) if label in task_classes]
+
+        train_subset = Subset(full_train_dataset, train_indices)
+        test_subset = Subset(full_test_dataset, test_indices)
+
+        train_loaders.append(DataLoader(train_subset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True))
+        test_loaders.append(DataLoader(test_subset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True))
         print(f"Task {task_id}: Classes {task_classes}, Train samples {len(train_subset)}, Test samples {len(test_subset)}")
+        
     return train_loaders, test_loaders
 
 def evaluate(model, test_loaders, device, num_tasks_seen, classes_per_task):
@@ -262,7 +320,7 @@ if __name__ == '__main__':
         "lambda_max": 100.0,
         "lambda_min": 0.01,
         "lambda_decay_epochs": 4,
-        "attention_bonus": 2.5,
+        "attention_bonus": 5.0,
         "data_task_idx": 0
     }
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"

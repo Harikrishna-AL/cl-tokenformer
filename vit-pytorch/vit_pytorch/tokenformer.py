@@ -104,6 +104,8 @@ class TokenformerAttention(nn.Module):
         self.norm = nn.LayerNorm(dim)
         self.attend = nn.Softmax(dim = -1)
         self.dropout = nn.Dropout(dropout)
+        if attn_num_param_tokens is None:
+            attn_num_param_tokens = inner_dim
         self.to_q = PattentionLayer(dim, inner_dim, num_param_tokens=attn_num_param_tokens, device=device)
         self.to_k = PattentionLayer(dim, inner_dim, num_param_tokens=attn_num_param_tokens, device=device)
         self.to_v = PattentionLayer(dim, inner_dim, num_param_tokens=attn_num_param_tokens, device=device)
@@ -131,8 +133,8 @@ class TokenformerEncoder(nn.Module):
         self.layers = nn.ModuleList([])
         for _ in range(depth):
             self.layers.append(nn.ModuleList([
-                TokenformerAttention(dim, heads=heads, dim_head=dim_head, attn_num_param_tokens=0, dropout=dropout, device=device),
-                TokenformerFeedForward(dim, mlp_dim, ffn_num_param_tokens=0, dropout=dropout, device=device)
+                TokenformerAttention(dim, heads=heads, dim_head=dim_head, attn_num_param_tokens=dim, dropout=dropout, device=device),
+                TokenformerFeedForward(dim, mlp_dim, ffn_num_param_tokens=mlp_dim, dropout=dropout, device=device)
             ]))
 
     def forward(self, x, task_id=-1, attention_bonus=0.0):
@@ -158,7 +160,8 @@ class ContinualLearner(nn.Module):
         dim_backbone = 512
         for param in self.backbone.parameters():
             param.requires_grad = False
-        self.adapter = nn.Linear(dim_backbone, dim)
+        # self.adapter = nn.Linear(dim_backbone, dim)
+        self.adapter = PattentionLayer(dim_backbone, dim, num_param_tokens=dim, device=device)
         self.growing_transformer = TokenformerEncoder(
             dim=dim, depth=depth, heads=heads, dim_head=dim, mlp_dim=mlp_dim, device=device
         )
@@ -166,7 +169,8 @@ class ContinualLearner(nn.Module):
         self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
         self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
         self.mlp_heads = nn.ModuleList([
-            nn.Linear(dim, classes_per_task) for _ in range(num_tasks)
+            # nn.Linear(dim, classes_per_task) for _ in range(num_tasks)
+            PattentionLayer(dim, classes_per_task, num_param_tokens=classes_per_task * 4, device=device) for _ in range(num_tasks)
         ])
         
     def forward(self, img, task_id):
@@ -188,6 +192,12 @@ class ContinualLearner(nn.Module):
         print("\n--- Growing Model (Tokenformer Encoder) ---")
         # NOTE: Growth factor is hardcoded for simplicity
         # new_tokens_per_layer = 128 // 2 
+        if isinstance(self.adapter, PattentionLayer):
+            if self.adapter.growth_indices == []:
+                new_tokens_per_layer = self.adapter.key_param_tokens.shape[0]
+            else:
+                new_tokens_per_layer = self.adapter.growth_indices[0]
+            self.adapter.grow(new_tokens_per_layer)
         for module in self.growing_transformer.modules():
             if isinstance(module, PattentionLayer):
                 if module.growth_indices == []:

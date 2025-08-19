@@ -34,10 +34,10 @@ def visualize_routing_attention(model, image, label, task_id):
     """
     # The routing layer was identified as the last FFN's second Pattention layer
     # Note: The path might change if you alter the TokenformerEncoder architecture
-    routing_layer = model.growing_transformer.layers[-1][1].net[4]
+    routing_layer = model.growing_transformer.layers[-1][1].pattn2
 
     # Perform a forward pass to populate the attention weights
-    _ = model(image.unsqueeze(0)) # Add batch dimension
+    _ = model(image.unsqueeze(0), task_id=task_id) # Add batch dimension
 
     # Get the attention weights for the CLS token (at sequence position 0)
     # The shape is (1, 1, num_param_tokens) -> squeeze to (num_param_tokens)
