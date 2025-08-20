@@ -186,7 +186,7 @@ def evaluate(model, test_loaders, device, num_tasks_seen, classes_per_task):
                 target = target - start_class
                 # Call model in task-free inference mode
                 # output = model(data, task_id=None, num_tasks_seen=num_tasks_seen)
-                output = model(data, task_id=task_id)
+                output = model(data, task_id=task_id, training=False)
                 
                 # Get the predicted GLOBAL class index
                 _, predicted = torch.max(output.data, 1)
@@ -248,6 +248,7 @@ def train_until_plateau(model, current_task_id, train_loader, optimizer, criteri
     min_delta = config["min_delta_loss"]
     lambda_max = config["lambda_max"]
     lambda_min = config["lambda_min"]
+    bonus_max = config["attention_bonus_max"]
     lambda_decay_epochs = config["lambda_decay_epochs"]
     patience_counter = 0
     best_loss = float('inf')
@@ -259,12 +260,14 @@ def train_until_plateau(model, current_task_id, train_loader, optimizer, criteri
         num_batches = 0
         decay_factor = max(0, (1 - epoch / lambda_decay_epochs))
         # current_lambda = lambda_min + (lambda_max - lambda_min) * decay_factor
+        current_attention_bonus = bonus_max * decay_factor
         current_lambda = lambda_max
         for batch_idx, (data, target) in enumerate(loop):
             data, target = data.to(device), target.to(device)
             target = target - current_task_id * classes_per_task
-            optimizer.zero_grad()
-            output = model(data, current_task_id)
+            # optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
+            output = model(data, current_task_id, current_attention_bonus=current_attention_bonus)
             task_loss = criterion(output, target)
             ortho_loss = 0.0
             if current_task_id > 0:
@@ -317,10 +320,11 @@ if __name__ == '__main__':
         "patience": 2,
         "min_delta_loss": 0.01,
         "lr": 1e-4,
-        "lambda_max": 100.0,
+        "lambda_max": 1.0,
         "lambda_min": 0.01,
         "lambda_decay_epochs": 4,
-        "attention_bonus": 5.0,
+        # "attention_bonus": 1.0,
+        "attention_bonus_max": 15.0,
         "data_task_idx": 0
     }
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -332,7 +336,7 @@ if __name__ == '__main__':
         dim=128, depth=2, heads=4, mlp_dim=256,
         num_tasks=config["num_tasks"], classes_per_task=config["classes_per_task"],
         device=DEVICE,
-        attention_bonus=config["attention_bonus"],
+        attention_bonus_max=config["attention_bonus_max"],
     ).to(DEVICE)
     
     train_loaders, test_loaders = get_split_mnist_loaders(config["num_tasks"], config["classes_per_task"], config["batch_size"])

@@ -26,15 +26,14 @@ class PattentionLayer(nn.Module):
         self.growth_indices = []
         self.attn_weights = None
 
-    def forward(self, x, task_id=-1, attention_bonus=0.0):
+    def forward(self, x, task_id=-1, attention_bonus=0.0, training=True):
         if self.key_param_tokens.shape[0] == 0:
             # ... (empty layer handling is the same) ...
             return torch.zeros(x.shape[:-1] + (self.value_param_tokens.shape[1],), device=self.device)
 
         similarity = torch.matmul(x, self.key_param_tokens.T) * self.scale
-        
         # ### NEW: Apply the Attention Bonus during Training ###
-        if self.training and task_id != -1:
+        if training and task_id > 0:
             bonus = torch.zeros_like(similarity)
             boundaries = [0] + self.growth_indices + [self.key_param_tokens.shape[0]]
             
@@ -52,7 +51,7 @@ class PattentionLayer(nn.Module):
             
         norm_similarity = F.normalize(similarity, p=2, dim=-1)
         attn_weights = F.gelu(norm_similarity)
-        self.attn_weights = attn_weights
+        self.attn_weights = similarity
         out = torch.matmul(attn_weights, self.value_param_tokens)
         return out
 
@@ -76,7 +75,7 @@ class PattentionLayer(nn.Module):
 
 ### --- Modules updated to pass task_id --- ###
 class TokenformerFeedForward(nn.Module):
-    def __init__(self, dim, hidden_dim, ffn_num_param_tokens, dropout = 0., device='cpu'):
+    def __init__(self, dim, hidden_dim, ffn_num_param_tokens, dropout = 0., device='cpu', training=True):
         super().__init__()
         self.layer_norm = nn.LayerNorm(dim)
         self.pattn1 = PattentionLayer(dim, hidden_dim, num_param_tokens=ffn_num_param_tokens, device=device)
@@ -85,17 +84,17 @@ class TokenformerFeedForward(nn.Module):
         self.pattn2 = PattentionLayer(hidden_dim, dim, num_param_tokens=ffn_num_param_tokens, device=device)
         self.dropout2 = nn.Dropout(dropout)
         
-    def forward(self, x, task_id=-1, attention_bonus=0.0):
+    def forward(self, x, task_id=-1, attention_bonus=0.0, training=True):
         x_norm = self.layer_norm(x)
-        x = self.pattn1(x_norm, task_id, attention_bonus)
+        x = self.pattn1(x_norm, task_id, attention_bonus, training)
         x = self.gelu(x)
         x = self.dropout1(x)
-        x = self.pattn2(x, task_id, attention_bonus)
+        x = self.pattn2(x, task_id, attention_bonus, training)
         x = self.dropout2(x)
         return x
 
 class TokenformerAttention(nn.Module):
-    def __init__(self, dim, heads = 8, dim_head = 64, attn_num_param_tokens=None, dropout = 0., device='cpu'):
+    def __init__(self, dim, heads = 8, dim_head = 64, attn_num_param_tokens=None, dropout = 0., device='cpu', training=True):
         super().__init__()
         inner_dim = dim_head * heads
         project_out = not (heads == 1 and dim_head == dim)
@@ -111,11 +110,11 @@ class TokenformerAttention(nn.Module):
         self.to_v = PattentionLayer(dim, inner_dim, num_param_tokens=attn_num_param_tokens, device=device)
         self.to_out = PattentionLayer(inner_dim, dim, num_param_tokens=attn_num_param_tokens, device=device) if project_out else nn.Identity()
 
-    def forward(self, x, task_id=-1, attention_bonus=0.0):
+    def forward(self, x, task_id=-1, attention_bonus=0.0, training=True):
         x_norm = self.norm(x)
-        q = self.to_q(x_norm, task_id, attention_bonus)
-        k = self.to_k(x_norm, task_id, attention_bonus)
-        v = self.to_v(x_norm, task_id, attention_bonus)
+        q = self.to_q(x_norm, task_id, attention_bonus, training)
+        k = self.to_k(x_norm, task_id, attention_bonus,training)
+        v = self.to_v(x_norm, task_id, attention_bonus, training)
         # ... (rest of the forward pass is the same) ...
         if q.shape[1] == 0: return torch.zeros_like(x)
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), (q, k, v))
@@ -124,7 +123,7 @@ class TokenformerAttention(nn.Module):
         attn = self.dropout(attn)
         out = torch.matmul(attn, v)
         out = rearrange(out, 'b h n d -> b n (h d)')
-        return self.to_out(out, task_id, attention_bonus)
+        return self.to_out(out, task_id, attention_bonus, training)
 
 class TokenformerEncoder(nn.Module):
     def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout = 0., device='cpu'):
@@ -137,18 +136,18 @@ class TokenformerEncoder(nn.Module):
                 TokenformerFeedForward(dim, mlp_dim, ffn_num_param_tokens=mlp_dim, dropout=dropout, device=device)
             ]))
 
-    def forward(self, x, task_id=-1, attention_bonus=0.0):
+    def forward(self, x, task_id=-1, attention_bonus=0.0, training=True):
         for attn, ff in self.layers:
-            x = attn(x, task_id, attention_bonus) + x
-            x = ff(x, task_id, attention_bonus) + x
+            x = attn(x, task_id=task_id, attention_bonus=attention_bonus, training=training) + x
+            x = ff(x, task_id=task_id, attention_bonus=attention_bonus, training=training) + x
         return self.norm(x)
 
 class ContinualLearner(nn.Module):
     def __init__(self, *, dim, depth, heads, mlp_dim, num_tasks, classes_per_task,
                 #  attn_tokens_per_task, ffn_tokens_per_task, 
-                 device='cpu', attention_bonus=0.0): # Add bonus here
+                 device='cpu', attention_bonus_max=0.0): # Add bonus here
         super().__init__()
-        self.attention_bonus = attention_bonus # Store bonus value
+        self.attention_bonus_max = attention_bonus_max # Store bonus value
         # ... (the rest of __init__ is the same as the "fair" version) ...
         self.num_tasks = num_tasks
         self.classes_per_task = classes_per_task
@@ -169,22 +168,22 @@ class ContinualLearner(nn.Module):
         self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
         self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
         self.mlp_heads = nn.ModuleList([
-            # nn.Linear(dim, classes_per_task) for _ in range(num_tasks)
-            PattentionLayer(dim, classes_per_task, num_param_tokens=classes_per_task * 4, device=device) for _ in range(num_tasks)
+            nn.Linear(dim, classes_per_task) for _ in range(num_tasks)
+            # PattentionLayer(dim, classes_per_task, num_param_tokens=classes_per_task * 4, device=device) for _ in range(num_tasks)
         ])
         
-    def forward(self, img, task_id):
+    def forward(self, img, task_id, training=True, current_attention_bonus=0.0):
         self.backbone.eval()
         feature_map = self.backbone(img)['features']
         patch_embeddings = rearrange(feature_map, 'b d h w -> b (h w) d')
-        adapted_embeddings = self.adapter(patch_embeddings)
+        adapted_embeddings = self.adapter(patch_embeddings, attention_bonus=current_attention_bonus, training=training)
         b, n, _ = adapted_embeddings.shape
         cls_tokens = repeat(self.cls_token, '1 1 d -> b 1 d', b=b)
         tokens = torch.cat((cls_tokens, adapted_embeddings), dim=1)
         tokens += self.pos_embedding
         
         # Pass the task_id AND bonus down to the encoder during training
-        output_sequence = self.growing_transformer(tokens, task_id, self.attention_bonus)
+        output_sequence = self.growing_transformer(tokens, task_id, current_attention_bonus, training=training)
         cls_output = output_sequence[:, 0]
         
         return self.mlp_heads[task_id](cls_output)

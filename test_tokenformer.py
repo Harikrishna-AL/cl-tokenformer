@@ -13,7 +13,7 @@ def load_model_from_checkpoint(filepath, config, device):
     model = ContinualLearner(
         dim=128, depth=2, heads=4, mlp_dim=256,
         num_tasks=config["num_tasks"], classes_per_task=config["classes_per_task"],
-        device=device
+        device=device, attention_bonus_max = 1,
     ).to(device)
     
     checkpoint = torch.load(filepath, map_location=device)
@@ -37,7 +37,7 @@ def visualize_routing_attention(model, image, label, task_id):
     routing_layer = model.growing_transformer.layers[-1][1].pattn2
 
     # Perform a forward pass to populate the attention weights
-    _ = model(image.unsqueeze(0), task_id=task_id) # Add batch dimension
+    _ = model(image.unsqueeze(0), task_id=task_id, training=False) # Add batch dimension
 
     # Get the attention weights for the CLS token (at sequence position 0)
     # The shape is (1, 1, num_param_tokens) -> squeeze to (num_param_tokens)
