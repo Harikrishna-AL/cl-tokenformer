@@ -356,7 +356,7 @@ def train_until_plateau(model, current_task_id, train_loader, optimizer, criteri
             if patience_counter == 1:
                 last_epoch_features.append(current_features.detach().cpu())
                 # We need per-sample loss, so we compute it here again without reduction
-                per_sample_loss = criterion(output, target).detach().cpu()
+                per_sample_loss = nn.CrossEntropyLoss(reduction='none')(output, target).detach().cpu()
                 last_epoch_losses.append(per_sample_loss)
 
         avg_epoch_loss = epoch_loss / num_batches if num_batches > 0 else float('inf')
