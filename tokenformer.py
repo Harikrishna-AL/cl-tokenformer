@@ -173,6 +173,49 @@ def get_split_mnist_loaders(num_tasks, classes_per_task, batch_size):
         
     return train_loaders, test_loaders
 
+class CuratedRehearsalBuffer:
+    """
+    A buffer that stores a few of the hardest samples per task.
+    "Hardest" is defined as the samples with the highest loss.
+    """
+    def __init__(self, samples_per_task=5):
+        self.samples_per_task = samples_per_task
+        # Buffer is now a dictionary mapping task_id to a list of feature vectors
+        self.buffer = {}
+
+    def add_task_samples(self, task_id, features, losses):
+        """Finds the k hardest samples and adds them to the buffer for the given task."""
+        if features is None or losses is None:
+            return
+            
+        # Get the indices of the samples with the highest loss
+        _, top_k_indices = torch.topk(losses, k=min(self.samples_per_task, len(losses)))
+        
+        hardest_samples = features[top_k_indices].detach().cpu()
+        self.buffer[task_id] = hardest_samples
+        print(f"✅ Stored {len(hardest_samples)} hardest samples for Task {task_id} in the buffer.")
+
+    def sample(self, batch_size):
+        """Samples a balanced batch from all past tasks in the buffer."""
+        if not self.buffer:
+            return None
+        
+        all_past_samples = torch.cat(list(self.buffer.values()), dim=0)
+        
+        if len(all_past_samples) == 0:
+            return None
+
+        indices = np.random.choice(len(all_past_samples), size=min(batch_size, len(all_past_samples)), replace=False)
+        return all_past_samples[indices]
+
+def separation_loss_fn(current_features, past_features):
+    """Pushes current features away from past features by minimizing cosine similarity."""
+    current_features = F.normalize(current_features, p=2, dim=1)
+    past_features = F.normalize(past_features, p=2, dim=1)
+    # The mean similarity is returned, which the optimizer will minimize (pushing it to -1)
+    # To make it more explicit to push towards orthogonality (similarity=0), we can use squared similarity.
+    return torch.mean(torch.matmul(current_features, past_features.T)**2)
+
 def evaluate(model, test_loaders, device, num_tasks_seen, classes_per_task):
     """ Task-free evaluation for the new single-output model. """
     model.eval()
@@ -240,7 +283,7 @@ def calculate_orthogonality_loss(growing_module):
                 num_layers += 1
     return ortho_loss / num_layers if num_layers > 0 else 0.0
 
-def train_until_plateau(model, current_task_id, train_loader, optimizer, criterion, device,
+def train_until_plateau(model, current_task_id, train_loader, optimizer, criterion, rehearsal_buffer, device,
                         classes_per_task, global_step, config):
     model.train()
     hook_handles = apply_masks_and_hooks(model, current_task_id, [])
@@ -253,6 +296,9 @@ def train_until_plateau(model, current_task_id, train_loader, optimizer, criteri
     patience_counter = 0
     best_loss = float('inf')
     epoch = 0
+    last_epoch_features = []
+    last_epoch_losses = []
+
     print(f"🚀 Starting training for model task {current_task_id} (patience={patience}, lambda: {lambda_max} -> {lambda_min}).")
     while patience_counter < patience:
         loop = tqdm(train_loader, leave=True)
@@ -262,17 +308,33 @@ def train_until_plateau(model, current_task_id, train_loader, optimizer, criteri
         # current_lambda = lambda_min + (lambda_max - lambda_min) * decay_factor
         current_attention_bonus = bonus_max * decay_factor
         current_lambda = lambda_max
+
+        if patience_counter == 1: 
+             last_epoch_features.clear()
+             last_epoch_losses.clear()
+
+        
         for batch_idx, (data, target) in enumerate(loop):
+
             data, target = data.to(device), target.to(device)
             target = target - current_task_id * classes_per_task
             # optimizer.zero_grad()
             optimizer.zero_grad(set_to_none=True)
-            output = model(data, current_task_id, current_attention_bonus=current_attention_bonus)
+            
+            output, current_features = model(data, current_task_id, current_attention_bonus=current_attention_bonus, return_features=True)
             task_loss = criterion(output, target)
+
             ortho_loss = 0.0
             if current_task_id > 0:
                 ortho_loss = calculate_orthogonality_loss(model.growing_transformer)
-            total_loss = task_loss + current_lambda * ortho_loss
+
+            sep_loss = 0.0
+            past_features = rehearsal_buffer.sample(data.size(0))
+            if past_features is not None:
+                past_features = past_features.to(device)
+                sep_loss = separation_loss_fn(current_features, past_features)
+
+            total_loss = task_loss + current_lambda * ortho_loss + config["lambda_sep"] * sep_loss
             total_loss.backward()
             optimizer.step()
             epoch_loss += total_loss.item()
@@ -286,9 +348,17 @@ def train_until_plateau(model, current_task_id, train_loader, optimizer, criteri
                 }
                 if current_task_id > 0:
                     log_data["ortho_loss"] = ortho_loss.item() if isinstance(ortho_loss, torch.Tensor) else ortho_loss
+                    log_data["sep_loss"] = sep_loss.item() if isinstance(sep_loss, torch.Tensor) else sep_loss
                 wandb.log(log_data)
             loop.set_description(f"Data Task {config['data_task_idx']} | Model Task {current_task_id} | Epoch {epoch+1}")
-            loop.set_postfix(loss=total_loss.item(), ortho=f"{ortho_loss.item() if isinstance(ortho_loss, torch.Tensor) else 0:.4f}", lambda_o=f"{current_lambda:.4f}")
+            loop.set_postfix(loss=total_loss.item(), ortho=f"{ortho_loss.item() if isinstance(ortho_loss, torch.Tensor) else 0:.4f}", lambda_o=f"{current_lambda:.4f}", sep_loss=f"{sep_loss.item() if isinstance(sep_loss, torch.Tensor) else 0:4f}")
+
+            if patience_counter == 1:
+                last_epoch_features.append(current_features.detach().cpu())
+                # We need per-sample loss, so we compute it here again without reduction
+                per_sample_loss = criterion(output, target).detach().cpu()
+                last_epoch_losses.append(per_sample_loss)
+
         avg_epoch_loss = epoch_loss / num_batches if num_batches > 0 else float('inf')
         print(f"\nEpoch {epoch+1} ended. Avg Total Loss: {avg_epoch_loss:.4f}. Best Loss: {best_loss:.4f}")
         if avg_epoch_loss < best_loss - min_delta:
@@ -302,9 +372,13 @@ def train_until_plateau(model, current_task_id, train_loader, optimizer, criteri
         if patience_counter >= patience:
             break
     print(f"🏁 Loss plateaued after {epoch} epochs.")
+
+    final_features = torch.cat(last_epoch_features) if last_epoch_features else None
+    final_losses = torch.cat(last_epoch_losses) if last_epoch_losses else None
+
     for handle in hook_handles:
         handle.remove()
-    return optimizer, global_step
+    return optimizer, global_step, final_features, final_losses
 
 if __name__ == '__main__':
     # ### NEW: Argument Parser for resuming ###
@@ -324,8 +398,11 @@ if __name__ == '__main__':
         "lambda_min": 0.01,
         "lambda_decay_epochs": 4,
         # "attention_bonus": 1.0,
-        "attention_bonus_max": 15.0,
-        "data_task_idx": 0
+        "attention_bonus_max": 0,
+        "data_task_idx": 0,
+        "lambda_sep": 1.0, 
+        "buffer_size": 500,
+        "samples_per_task": 10,
     }
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -342,6 +419,7 @@ if __name__ == '__main__':
     train_loaders, test_loaders = get_split_mnist_loaders(config["num_tasks"], config["classes_per_task"], config["batch_size"])
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=config["lr"])
+    rehearsal_buffer = CuratedRehearsalBuffer(samples_per_task=config["samples_per_task"])
 
     # ### NEW: Initialize state variables and load checkpoint if provided ###
     start_task_idx = 0
@@ -369,11 +447,13 @@ if __name__ == '__main__':
              if WANDB_AVAILABLE:
                  wandb.log({"growth_event": 1, "model_task_id": current_task_id, "global_step": global_step, "trainable_parameters": count_parameters(model, trainable_only=True)})
         
-        optimizer, global_step = train_until_plateau(
-            model, current_task_id, train_loaders[data_task_idx], optimizer, criterion, DEVICE, 
+        optimizer, global_step, final_features, final_losses = train_until_plateau(
+            model, current_task_id, train_loaders[data_task_idx], optimizer, criterion, rehearsal_buffer, DEVICE, 
             config["classes_per_task"], global_step, config
         )
         
+        rehearsal_buffer.add_task_samples(current_task_id, final_features, final_losses)
+
         print(f"--- Finished Training on Data Task {data_task_idx} ---")
         accuracies = evaluate(model, test_loaders, DEVICE, current_task_id + 1, config["classes_per_task"])
         

@@ -13,7 +13,7 @@ def load_model_from_checkpoint(filepath, config, device):
     model = ContinualLearner(
         dim=128, depth=2, heads=4, mlp_dim=256,
         num_tasks=config["num_tasks"], classes_per_task=config["classes_per_task"],
-        device=device, attention_bonus_max = 1,
+        device=device, attention_bonus_max = 0,
     ).to(device)
     
     checkpoint = torch.load(filepath, map_location=device)

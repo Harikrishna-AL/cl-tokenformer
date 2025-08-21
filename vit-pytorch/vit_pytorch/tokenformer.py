@@ -10,6 +10,18 @@ from einops import rearrange, repeat
 
 # PattentionLayer, TokenformerFeedForward, TokenformerAttention, TokenformerEncoder
 # are unchanged. They are the core building blocks.
+
+class ProjectionHead(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim)
+        )
+    def forward(self, x):
+        return self.net(x)
+
 class PattentionLayer(nn.Module):
     def __init__(self, dim_in, dim_out, num_param_tokens, device='cpu'):
         super().__init__()
@@ -160,7 +172,13 @@ class ContinualLearner(nn.Module):
         for param in self.backbone.parameters():
             param.requires_grad = False
         # self.adapter = nn.Linear(dim_backbone, dim)
-        self.adapter = PattentionLayer(dim_backbone, dim, num_param_tokens=dim, device=device)
+        self.projection_head = ProjectionHead(
+            input_dim=dim_backbone,
+            hidden_dim=dim_backbone,
+            output_dim=dim # Project to the Tokenformer's dimension
+        )
+
+        # self.adapter = PattentionLayer(dim_backbone, dim, num_param_tokens=dim, device=device)
         self.growing_transformer = TokenformerEncoder(
             dim=dim, depth=depth, heads=heads, dim_head=dim, mlp_dim=mlp_dim, device=device
         )
@@ -172,31 +190,36 @@ class ContinualLearner(nn.Module):
             # PattentionLayer(dim, classes_per_task, num_param_tokens=classes_per_task * 4, device=device) for _ in range(num_tasks)
         ])
         
-    def forward(self, img, task_id, training=True, current_attention_bonus=0.0):
+    def forward(self, img, task_id, training=True, current_attention_bonus=0.0, return_features=False):
         self.backbone.eval()
         feature_map = self.backbone(img)['features']
         patch_embeddings = rearrange(feature_map, 'b d h w -> b (h w) d')
-        adapted_embeddings = self.adapter(patch_embeddings, attention_bonus=current_attention_bonus, training=training)
-        b, n, _ = adapted_embeddings.shape
+        # adapted_embeddings = self.adapter(patch_embeddings, attention_bonus=current_attention_bonus, training=training)
+        projected_features = self.projection_head(patch_embeddings)
+        b, n, _ = projected_features.shape
         cls_tokens = repeat(self.cls_token, '1 1 d -> b 1 d', b=b)
-        tokens = torch.cat((cls_tokens, adapted_embeddings), dim=1)
+        tokens = torch.cat((cls_tokens, projected_features), dim=1)
         tokens += self.pos_embedding
         
         # Pass the task_id AND bonus down to the encoder during training
         output_sequence = self.growing_transformer(tokens, task_id, current_attention_bonus, training=training)
         cls_output = output_sequence[:, 0]
         
+        if return_features:
+            return self.mlp_heads[task_id](cls_output), cls_output
+
         return self.mlp_heads[task_id](cls_output)
+
     def grow(self):
         print("\n--- Growing Model (Tokenformer Encoder) ---")
         # NOTE: Growth factor is hardcoded for simplicity
         # new_tokens_per_layer = 128 // 2 
-        if isinstance(self.adapter, PattentionLayer):
-            if self.adapter.growth_indices == []:
-                new_tokens_per_layer = self.adapter.key_param_tokens.shape[0]
-            else:
-                new_tokens_per_layer = self.adapter.growth_indices[0]
-            self.adapter.grow(new_tokens_per_layer)
+        # if isinstance(self.adapter, PattentionLayer):
+        #     if self.adapter.growth_indices == []:
+        #         new_tokens_per_layer = self.adapter.key_param_tokens.shape[0]
+        #     else:
+        #         new_tokens_per_layer = self.adapter.growth_indices[0]
+        #     self.adapter.grow(new_tokens_per_layer)
         for module in self.growing_transformer.modules():
             if isinstance(module, PattentionLayer):
                 if module.growth_indices == []:
