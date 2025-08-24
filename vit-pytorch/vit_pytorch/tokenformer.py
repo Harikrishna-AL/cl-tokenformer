@@ -189,6 +189,19 @@ class ContinualLearner(nn.Module):
             nn.Linear(dim, classes_per_task) for _ in range(num_tasks)
             # PattentionLayer(dim, classes_per_task, num_param_tokens=classes_per_task * 4, device=device) for _ in range(num_tasks)
         ])
+
+    def projection_head_params(self):
+        """Returns an iterator over the projection head's parameters."""
+        return self.projection_head.parameters()
+        
+    def continual_learning_params(self):
+        """
+        Returns an iterator over all trainable parameters EXCEPT the projection head.
+        This includes the adapter, the growing transformer, CLS/Pos tokens, and MLP heads.
+        """
+        for name, param in self.named_parameters():
+            if param.requires_grad and 'projection_head' not in name:
+                yield param
         
     def forward(self, img, task_id, training=True, current_attention_bonus=0.0, return_features=False):
         self.backbone.eval()
@@ -196,6 +209,7 @@ class ContinualLearner(nn.Module):
         patch_embeddings = rearrange(feature_map, 'b d h w -> b (h w) d')
         # adapted_embeddings = self.adapter(patch_embeddings, attention_bonus=current_attention_bonus, training=training)
         projected_features = self.projection_head(patch_embeddings)
+        project_feature_vect = torch.mean(projected_features, dim=1)
         b, n, _ = projected_features.shape
         cls_tokens = repeat(self.cls_token, '1 1 d -> b 1 d', b=b)
         tokens = torch.cat((cls_tokens, projected_features), dim=1)
@@ -206,7 +220,15 @@ class ContinualLearner(nn.Module):
         cls_output = output_sequence[:, 0]
         
         if return_features:
-            return self.mlp_heads[task_id](cls_output), cls_output
+            return self.mlp_heads[task_id](cls_output), project_feature_vect
+        
+        # if training == False or return_features:
+        #     outputs = []
+        #     for o in range(self.num_tasks):
+        #         out = self.mlp_heads[o](cls_output)
+        #         outputs.append(out)
+        #     outputs = torch.cat(outputs, dim=1)
+        #     return outputs, project_feature_vect
 
         return self.mlp_heads[task_id](cls_output)
 

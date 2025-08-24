@@ -22,12 +22,10 @@ except ImportError:
 ### --- NEW: CHECKPOINTING FUNCTIONS --- ###
 
 def save_checkpoint(state, filename="checkpoint.pth.tar"):
-    """Saves model and training state."""
     print("=> Saving checkpoint")
     torch.save(state, filename)
 
-def load_checkpoint(model, optimizer, filename="checkpoint.pth.tar"):
-    """Loads model and training state, handling model growth."""
+def load_checkpoint(model, filename="checkpoint.pth.tar"):
     if os.path.isfile(filename):
         print(f"=> Loading checkpoint '{filename}'")
         checkpoint = torch.load(filename, map_location=DEVICE)
@@ -36,7 +34,6 @@ def load_checkpoint(model, optimizer, filename="checkpoint.pth.tar"):
         global_step = checkpoint['global_step']
         results_history = checkpoint['results_history']
         
-        # IMPORTANT: Grow the model to the saved size BEFORE loading the state dict
         if checkpoint['current_task_id'] > 0:
             print(f"Growing model to saved state (Task {checkpoint['current_task_id']})...")
             for _ in range(checkpoint['current_task_id']):
@@ -44,15 +41,12 @@ def load_checkpoint(model, optimizer, filename="checkpoint.pth.tar"):
 
         model.load_state_dict(checkpoint['model_state_dict'])
         
-        # Re-initialize optimizer for the new set of trainable parameters
-        optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=config["lr"])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        
         print(f"=> Loaded checkpoint! Resuming from Task {start_task_idx}")
-        return model, optimizer, start_task_idx, global_step, results_history
+        # Optimizers will be re-created and loaded in the main script
+        return model, start_task_idx, global_step, results_history, checkpoint.get('optimizers_state_dict')
     else:
         print(f"=> No checkpoint found at '{filename}'")
-        return model, optimizer, 0, 0, {}
+        return model, 0, 0, {}, None
 
 ### --- NEW: RESULTS TABLE FUNCTION --- ###
 
@@ -283,7 +277,7 @@ def calculate_orthogonality_loss(growing_module):
                 num_layers += 1
     return ortho_loss / num_layers if num_layers > 0 else 0.0
 
-def train_until_plateau(model, current_task_id, train_loader, optimizer, criterion, rehearsal_buffer, device,
+def train_until_plateau(model, current_task_id, train_loader, optimizer_main, optimizer_proj, criterion, rehearsal_buffer, device,
                         classes_per_task, global_step, config):
     model.train()
     hook_handles = apply_masks_and_hooks(model, current_task_id, [])
@@ -319,7 +313,9 @@ def train_until_plateau(model, current_task_id, train_loader, optimizer, criteri
             data, target = data.to(device), target.to(device)
             target = target - current_task_id * classes_per_task
             # optimizer.zero_grad()
-            optimizer.zero_grad(set_to_none=True)
+            # optimizer.zero_grad(set_to_none=True)
+            optimizer_main.zero_grad(set_to_none=True)
+            optimizer_proj.zero_grad(set_to_none=True)
             
             output, current_features = model(data, current_task_id, current_attention_bonus=current_attention_bonus, return_features=True)
             task_loss = criterion(output, target)
@@ -334,9 +330,15 @@ def train_until_plateau(model, current_task_id, train_loader, optimizer, criteri
                 past_features = past_features.to(device)
                 sep_loss = separation_loss_fn(current_features, past_features)
 
-            total_loss = task_loss + current_lambda * ortho_loss + config["lambda_sep"] * sep_loss
-            total_loss.backward()
-            optimizer.step()
+            total_loss = task_loss + current_lambda * ortho_loss 
+            total_loss.backward(retain_graph=True)
+
+            if isinstance(sep_loss, torch.Tensor):
+                sep_loss.backward()
+
+            optimizer_main.step()
+            optimizer_proj.step()
+
             epoch_loss += total_loss.item()
             num_batches += 1
             global_step += 1
@@ -378,7 +380,7 @@ def train_until_plateau(model, current_task_id, train_loader, optimizer, criteri
 
     for handle in hook_handles:
         handle.remove()
-    return optimizer, global_step, final_features, final_losses
+    return optimizer_main, optimizer_proj, global_step, final_features, final_losses
 
 if __name__ == '__main__':
     # ### NEW: Argument Parser for resuming ###
@@ -400,7 +402,7 @@ if __name__ == '__main__':
         # "attention_bonus": 1.0,
         "attention_bonus_max": 0,
         "data_task_idx": 0,
-        "lambda_sep": 1.0, 
+        "lambda_sep": 10.0, 
         "buffer_size": 500,
         "samples_per_task": 10,
     }
@@ -418,7 +420,9 @@ if __name__ == '__main__':
     
     train_loaders, test_loaders = get_split_mnist_loaders(config["num_tasks"], config["classes_per_task"], config["batch_size"])
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=config["lr"])
+    # optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=config["lr"])
+    optimizer_main = torch.optim.Adam(model.continual_learning_params(), lr=config["lr"])
+    optimizer_proj = torch.optim.Adam(model.projection_head_params(), lr=config["lr"])
     rehearsal_buffer = CuratedRehearsalBuffer(samples_per_task=config["samples_per_task"])
 
     # ### NEW: Initialize state variables and load checkpoint if provided ###
@@ -428,8 +432,11 @@ if __name__ == '__main__':
     results_history = {}
 
     if args.resume:
-        model, optimizer, start_task_idx, global_step, results_history = load_checkpoint(model, optimizer, args.resume)
-        current_task_id = start_task_idx - 1
+        model, start_task_idx, global_step, results_history, optimizers_state_dict = load_checkpoint(model, args.resume)
+        if optimizers_state_dict:
+            optimizer_main.load_state_dict(optimizers_state_dict['main'])
+            optimizer_proj.load_state_dict(optimizers_state_dict['proj'])
+        current_task_id = start_task_idx - 1 if start_task_idx > 0 else 0
     
     print(f"Total model parameters: {count_parameters(model):,}")
     print(f"Trainable parameters: {count_parameters(model, trainable_only=True):,}")
@@ -443,12 +450,14 @@ if __name__ == '__main__':
              current_task_id += 1
              model.grow()
              print(f"Trainable parameters after growth: {count_parameters(model, trainable_only=True):,}")
-             optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=config["lr"])
+            #  optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=config["lr"])
+             optimizer_main = torch.optim.Adam(model.continual_learning_params(), lr=config["lr"])
+             optimizer_proj = torch.optim.Adam(model.projection_head_params(), lr=config["lr"])
              if WANDB_AVAILABLE:
                  wandb.log({"growth_event": 1, "model_task_id": current_task_id, "global_step": global_step, "trainable_parameters": count_parameters(model, trainable_only=True)})
         
-        optimizer, global_step, final_features, final_losses = train_until_plateau(
-            model, current_task_id, train_loaders[data_task_idx], optimizer, criterion, rehearsal_buffer, DEVICE, 
+        optimizer_main, optimizer_proj, global_step, final_features, final_losses = train_until_plateau(
+            model, current_task_id, train_loaders[data_task_idx], optimizer_main, optimizer_proj, criterion, rehearsal_buffer, DEVICE, 
             config["classes_per_task"], global_step, config
         )
         
@@ -464,7 +473,10 @@ if __name__ == '__main__':
             'current_task_id': current_task_id,
             'global_step': global_step,
             'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
+            'optimizers_state_dict': {
+                'main': optimizer_main.state_dict(),
+                'proj': optimizer_proj.state_dict(),
+            },
             'results_history': results_history,
         }
         save_checkpoint(state_to_save, filename=f"checkpoint_task_{current_task_id}_final.pth.tar")
