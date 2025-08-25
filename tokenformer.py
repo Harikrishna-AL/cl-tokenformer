@@ -2,13 +2,14 @@ import torch
 import torch.nn as nn
 from vit_pytorch import ContinualLearner # Assuming the edited vit_pytorch.py is in the same directory
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset, TensorDataset
+from torch.utils.data import DataLoader, Subset, TensorDataset, Dataset
 from torchvision.datasets import MNIST
 from torchvision import transforms
 from tqdm import tqdm
 import numpy as np
 import os
 import argparse
+from einops import rearrange, repeat
 
 # --- Utility Functions (Unchanged) ---
 def save_checkpoint(state, filename="checkpoint.pth.tar"):
@@ -287,6 +288,9 @@ if __name__ == '__main__':
 
         print(f"\n--- Evaluating after Task {data_task_idx} ---")
         accuracies = evaluate(model, test_loaders, DEVICE, current_task_id + 1, config["classes_per_task"])
+        avg_accuracy = np.mean(accuracies)
+        print(f"--- Average Accuracy across all {len(accuracies)} seen tasks: {avg_accuracy:.2f}% ---")
+        
         results_history[current_task_id] = accuracies
         save_checkpoint({
             'current_task_id': current_task_id, 'global_step': global_step,

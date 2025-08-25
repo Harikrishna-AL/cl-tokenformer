@@ -47,6 +47,8 @@ class PattentionLayer(nn.Module):
     def forward(self, x, task_id=-1, attention_bonus=0.0, training=True):
         if self.key_param_tokens.shape[0] == 0: return torch.zeros(x.shape[:-1] + (self.value_param_tokens.shape[1],), device=self.device)
         similarity = torch.matmul(x, self.key_param_tokens.T) * self.scale
+         ### EDITED: Added this line back for visualization purposes ###
+        self.attn_weights = similarity 
         attn_weights = F.gelu(F.normalize(similarity, p=2, dim=-1))
         return torch.matmul(attn_weights, self.value_param_tokens)
     def grow(self, num_new_tokens):
