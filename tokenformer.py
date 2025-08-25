@@ -1,490 +1,296 @@
-# tokenformer_inference.py
 import torch
 import torch.nn as nn
-from vit_pytorch import ContinualLearner, PattentionLayer
+from vit_pytorch import ContinualLearner # Assuming the edited vit_pytorch.py is in the same directory
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset, TensorDataset, Dataset
+from torch.utils.data import DataLoader, Subset, TensorDataset
 from torchvision.datasets import MNIST
 from torchvision import transforms
 from tqdm import tqdm
 import numpy as np
 import os
-import argparse # ### NEW: For command-line arguments ###
+import argparse
 
-# Try to import wandb
-try:
-    import wandb
-    WANDB_AVAILABLE = True
-except ImportError:
-    WANDB_AVAILABLE = False
-    print("wandb not installed. Skipping W&B logging. To install: pip install wandb")
-
-### --- NEW: CHECKPOINTING FUNCTIONS --- ###
-
+# --- Utility Functions (Unchanged) ---
 def save_checkpoint(state, filename="checkpoint.pth.tar"):
     print("=> Saving checkpoint")
     torch.save(state, filename)
-
+# Other utilities like load_checkpoint, print_results_table, etc. remain the same...
 def load_checkpoint(model, filename="checkpoint.pth.tar"):
     if os.path.isfile(filename):
         print(f"=> Loading checkpoint '{filename}'")
         checkpoint = torch.load(filename, map_location=DEVICE)
-        
-        start_task_idx = checkpoint['current_task_id'] + 1
-        global_step = checkpoint['global_step']
-        results_history = checkpoint['results_history']
-        
+        start_task_idx, global_step, results_history = checkpoint['current_task_id'] + 1, checkpoint['global_step'], checkpoint['results_history']
         if checkpoint['current_task_id'] > 0:
             print(f"Growing model to saved state (Task {checkpoint['current_task_id']})...")
-            for _ in range(checkpoint['current_task_id']):
-                model.grow()
-
+            for _ in range(checkpoint['current_task_id']): model.grow()
         model.load_state_dict(checkpoint['model_state_dict'])
-        
         print(f"=> Loaded checkpoint! Resuming from Task {start_task_idx}")
-        # Optimizers will be re-created and loaded in the main script
-        return model, start_task_idx, global_step, results_history, checkpoint.get('optimizers_state_dict')
+        return model, start_task_idx, global_step, results_history
     else:
-        print(f"=> No checkpoint found at '{filename}'")
-        return model, 0, 0, {}, None
-
-### --- NEW: RESULTS TABLE FUNCTION --- ###
-
+        print(f"=> No checkpoint found at '{filename}'"); return model, 0, 0, {}
 def print_results_table(history, num_tasks):
-    """Prints a formatted table of average accuracies."""
     print("\n\n--- Final Results Summary ---")
-    
-    # Header
-    header = f"{'After Training Task':<25}"
-    for i in range(num_tasks):
-        header += f"  Task {i} Acc (%) "
-    header += "  Average Acc (%)"
-    print(header)
-    print("-" * len(header))
-
-    # Rows
-    for trained_task_id, accs in history.items():
-        row = f"{f'Task {trained_task_id}':<25}"
-        
-        # Print accuracies for tasks seen so far
-        for i in range(len(accs)):
-            row += f"    {accs[i]:<10.2f}"
-        
-        # Fill in the rest with dashes
-        for i in range(num_tasks - len(accs)):
-            row += f"    {'--':<10}"
-            
-        avg_acc = np.mean(accs)
-        row += f"    {avg_acc:<10.2f}"
+    header = f"{'After Training Task':<25}" + "".join([f"  Task {i} Acc (%) " for i in range(num_tasks)]) + "  Average Acc (%)"
+    print(header + "\n" + "-" * len(header))
+    for tid, accs in history.items():
+        row = f"{f'Task {tid}':<25}" + "".join([f"    {acc:<10.2f}" for acc in accs]) + "".join([f"    {'--':<10}" for _ in range(num_tasks - len(accs))]) + f"    {np.mean(accs):<10.2f}"
         print(row)
     print("-" * len(header))
-
-
-# ... (count_parameters, get_split_mnist_loaders, evaluate, apply_masks_and_hooks, calculate_orthogonality_loss are unchanged) ...
-# ... (train_until_plateau is also unchanged from the last corrected version) ...
 def count_parameters(model, trainable_only=False):
-    if trainable_only:
-        return sum(p.numel() for p in model.parameters() if p.requires_grad)
-    return sum(p.numel() for p in model.parameters())
+    params = model.parameters()
+    if trainable_only: params = filter(lambda p: p.requires_grad, params)
+    return sum(p.numel() for p in params)
 
+# --- Data Loading (Unchanged) ---
 def preprocess_mnist_to_disk(root='./data'):
-    """
-    Transforms and saves each MNIST image as a separate file.
-    This is a one-time, memory-safe operation.
-    """
     preprocessed_dir = os.path.join(root, "mnist_preprocessed")
-    if os.path.exists(preprocessed_dir):
-        print(f"✔️ Preprocessed data found at {preprocessed_dir}")
-        return
-
+    if os.path.exists(preprocessed_dir): return
     print(f"⚠️ No preprocessed data found. Creating cache at {preprocessed_dir}...")
     os.makedirs(preprocessed_dir, exist_ok=True)
-
     transform = transforms.Compose([
-        transforms.Resize(224),
-        transforms.Grayscale(num_output_channels=3),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        transforms.Resize(224), transforms.Grayscale(num_output_channels=3),
+        transforms.ToTensor(), transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
-
     for split in ['train', 'test']:
-        is_train = (split == 'train')
-        raw_dataset = MNIST(root=root, train=is_train, download=True)
-        split_dir = os.path.join(preprocessed_dir, split)
+        raw_dataset, split_dir = MNIST(root=root, train=(split == 'train'), download=True), os.path.join(preprocessed_dir, split)
         os.makedirs(split_dir, exist_ok=True)
-        
         for i, (img, label) in enumerate(tqdm(raw_dataset, desc=f"Preprocessing {split} set")):
-            transformed_img = transform(img)
-            save_path = os.path.join(split_dir, f"sample_{i}.pt")
-            torch.save((transformed_img, label), save_path)
-
+            torch.save((transform(img), label), os.path.join(split_dir, f"sample_{i}.pt"))
 class PreprocessedMNIST(Dataset):
-    """
-    A custom Dataset class that loads pre-transformed tensors from disk.
-    Initialization is fast as it only scans for file paths.
-    """
     def __init__(self, root='./data', train=True):
         split = 'train' if train else 'test'
         self.data_dir = os.path.join(root, "mnist_preprocessed", split)
         self.samples = [os.path.join(self.data_dir, f) for f in os.listdir(self.data_dir) if f.endswith('.pt')]
-        
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, index):
-        # Load one pre-transformed sample from disk
-        return torch.load(self.samples[index])
-
+    def __len__(self): return len(self.samples)
+    def __getitem__(self, index): return torch.load(self.samples[index])
 def get_split_mnist_loaders(num_tasks, classes_per_task, batch_size):
-    """ Prepares Split MNIST dataloaders using the on-disk cache. """
-    # Ensure the on-disk cache exists, creating it if necessary
     preprocess_mnist_to_disk()
-
-    # Load the custom datasets which point to the preprocessed files
-    full_train_dataset = PreprocessedMNIST(train=True)
-    full_test_dataset = PreprocessedMNIST(train=False)
-
-    # Get the original labels for splitting
-    raw_mnist_train = MNIST(root='./data', train=True, download=True)
-    raw_mnist_test = MNIST(root='./data', train=False, download=True)
-
     train_loaders, test_loaders = [], []
-    for task_id in range(num_tasks):
-        start_class = task_id * classes_per_task
-        end_class = (task_id + 1) * classes_per_task
-        task_classes = list(range(start_class, end_class))
-        
-        # Find indices for the current task (this is fast)
+    raw_mnist_train, raw_mnist_test = MNIST(root='./data', train=True, download=True), MNIST(root='./data', train=False, download=True)
+    full_train_dataset, full_test_dataset = PreprocessedMNIST(train=True), PreprocessedMNIST(train=False)
+    for tid in range(num_tasks):
+        task_classes = list(range(tid * classes_per_task, (tid + 1) * classes_per_task))
         train_indices = [i for i, label in enumerate(raw_mnist_train.targets) if label in task_classes]
         test_indices = [i for i, label in enumerate(raw_mnist_test.targets) if label in task_classes]
-
-        train_subset = Subset(full_train_dataset, train_indices)
-        test_subset = Subset(full_test_dataset, test_indices)
-
-        train_loaders.append(DataLoader(train_subset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True))
-        test_loaders.append(DataLoader(test_subset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True))
-        print(f"Task {task_id}: Classes {task_classes}, Train samples {len(train_subset)}, Test samples {len(test_subset)}")
-        
+        train_loaders.append(DataLoader(Subset(full_train_dataset, train_indices), batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True))
+        test_loaders.append(DataLoader(Subset(full_test_dataset, test_indices), batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True))
     return train_loaders, test_loaders
 
-class CuratedRehearsalBuffer:
-    """
-    A buffer that stores a few of the hardest samples per task.
-    "Hardest" is defined as the samples with the highest loss.
-    """
-    def __init__(self, samples_per_task=5):
-        self.samples_per_task = samples_per_task
-        # Buffer is now a dictionary mapping task_id to a list of feature vectors
-        self.buffer = {}
 
-    def add_task_samples(self, task_id, features, losses):
-        """Finds the k hardest samples and adds them to the buffer for the given task."""
-        if features is None or losses is None:
+### --- MODIFIED: BUFFER STORES RESNET FEATURES, SEPARATED FEATURES, AND LABELS --- ###
+class CuratedRehearsalBuffer:
+    def __init__(self, samples_per_task=10):
+        self.samples_per_task = samples_per_task
+        self.buffer = {} # Maps task_id to a tuple of (resnet_features, separated_features, labels)
+
+    def add_task_samples(self, task_id, resnet_features, separated_features, losses, labels):
+        if resnet_features is None or separated_features is None or losses is None or labels is None:
             return
-            
-        # Get the indices of the samples with the highest loss
         _, top_k_indices = torch.topk(losses, k=min(self.samples_per_task, len(losses)))
         
-        hardest_samples = features[top_k_indices].detach().cpu()
-        self.buffer[task_id] = hardest_samples
-        print(f"✅ Stored {len(hardest_samples)} hardest samples for Task {task_id} in the buffer.")
+        self.buffer[task_id] = (
+            resnet_features[top_k_indices].detach().cpu(),
+            separated_features[top_k_indices].detach().cpu(),
+            labels[top_k_indices].detach().cpu()
+        )
+        print(f"✅ Stored {len(top_k_indices)} hardest samples for Task {task_id} in the buffer.")
 
     def sample(self, batch_size):
-        """Samples a balanced batch from all past tasks in the buffer."""
         if not self.buffer:
-            return None
+            return None, None, None
         
-        all_past_samples = torch.cat(list(self.buffer.values()), dim=0)
+        all_resnet_feats = torch.cat([item[0] for item in self.buffer.values()], dim=0)
+        all_separated_feats = torch.cat([item[1] for item in self.buffer.values()], dim=0)
+        all_labels = torch.cat([item[2] for item in self.buffer.values()], dim=0)
         
-        if len(all_past_samples) == 0:
-            return None
+        if len(all_resnet_feats) == 0:
+            return None, None, None
 
-        indices = np.random.choice(len(all_past_samples), size=min(batch_size, len(all_past_samples)), replace=False)
-        return all_past_samples[indices]
+        indices = np.random.choice(len(all_resnet_feats), size=min(batch_size, len(all_resnet_feats)), replace=False)
+        return all_resnet_feats[indices], all_separated_feats[indices], all_labels[indices]
 
-def separation_loss_fn(current_features, past_features):
-    """Pushes current features away from past features by minimizing cosine similarity."""
-    current_features = F.normalize(current_features, p=2, dim=1)
-    past_features = F.normalize(past_features, p=2, dim=1)
-    # The mean similarity is returned, which the optimizer will minimize (pushing it to -1)
-    # To make it more explicit to push towards orthogonality (similarity=0), we can use squared similarity.
-    return torch.mean(torch.matmul(current_features, past_features.T)**2)
+
+def calculate_feature_orthogonality_loss(features):
+    if features is None or features.shape[0] < 2: return 0.0
+    features_norm = F.normalize(features, p=2, dim=1)
+    covariance_matrix = torch.matmul(features_norm.T, features_norm)
+    identity = torch.eye(features.shape[1], device=features.device)
+    off_diagonal_covariance = covariance_matrix * (1 - identity)
+    return torch.mean(off_diagonal_covariance**2)
 
 def evaluate(model, test_loaders, device, num_tasks_seen, classes_per_task):
-    """ Task-free evaluation for the new single-output model. """
     model.eval()
     accuracies = []
     with torch.no_grad():
         for task_id in range(num_tasks_seen):
             correct, total = 0, 0
-            start_class = task_id * classes_per_task
             for data, target in test_loaders[task_id]:
                 data, target = data.to(device), target.to(device)
-                target = target - start_class
-                # Call model in task-free inference mode
-                # output = model(data, task_id=None, num_tasks_seen=num_tasks_seen)
-                output = model(data, task_id=task_id, training=False)
-                
-                # Get the predicted GLOBAL class index
+                output, _, _, _ = model(data, task_id=task_id, training=False)
+                local_target = target - task_id * classes_per_task
                 _, predicted = torch.max(output.data, 1)
-                
-                total += target.size(0)
-                # Compare the predicted GLOBAL index with the true GLOBAL target
-                correct += (predicted == target).sum().item()
-
-            accuracy = 100 * correct / total
-            accuracies.append(accuracy)
-            print(f"Accuracy on Task {task_id}: {accuracy:.2f}%")
+                total += local_target.size(0)
+                correct += (predicted == local_target).sum().item()
+            accuracies.append(100 * correct / total)
     return accuracies
 
-def apply_grad_mask_hook(grad, mask):
-    return grad * mask
 
-def apply_masks_and_hooks(model, current_task_id, previous_handles):
-    for handle in previous_handles:
-        handle.remove()
-    new_handles = []
-    for module in model.growing_transformer.modules():
-        if isinstance(module, PattentionLayer):
-            new_handles.append(module.key_param_tokens.register_hook(
-                lambda grad, m=module: apply_grad_mask_hook(grad, m.key_grad_mask)
-            ))
-            new_handles.append(module.value_param_tokens.register_hook(
-                lambda grad, m=module: apply_grad_mask_hook(grad, m.value_grad_mask)
-            ))
-    return new_handles
+### --- NEW: WAKE AND SLEEP TRAINING FUNCTIONS --- ###
 
-def calculate_orthogonality_loss(growing_module):
-    ortho_loss = 0.0
-    num_layers = 0
-    for module in growing_module.modules():
-        if isinstance(module, PattentionLayer) and module.growth_indices:
-            last_growth_idx = module.growth_indices[-1]
-            k_old = module.key_param_tokens[:last_growth_idx]
-            k_new = module.key_param_tokens[last_growth_idx:]
-
-            v_old = module.value_param_tokens[:last_growth_idx]
-            v_new = module.value_param_tokens[last_growth_idx:]
-
-            if (k_old.numel() > 0 and k_new.numel() > 0) and (v_old.numel() > 0 and v_new.numel() > 0):
-                k_old_norm = F.normalize(k_old, p=2, dim=1)
-                k_new_norm = F.normalize(k_new, p=2, dim=1)
-                v_old_norm = F.normalize(v_old, p=2, dim=1)
-                v_new_norm = F.normalize(v_new, p=2, dim=1)
-                cosine_sim_matrix = torch.matmul(k_old_norm, k_new_norm.T)
-                cosine_sim_matrix_v = torch.matmul(v_old_norm, v_new_norm.T)
-                ortho_loss += (torch.mean(cosine_sim_matrix**2) + torch.mean(cosine_sim_matrix_v**2))
-                num_layers += 1
-    return ortho_loss / num_layers if num_layers > 0 else 0.0
-
-def train_until_plateau(model, current_task_id, train_loader, optimizer_main, optimizer_proj, criterion, rehearsal_buffer, device,
-                        classes_per_task, global_step, config):
+def wake_phase_training(model, current_task_id, train_loader, optimizer_sep_ae, optimizer_head, criterion, rehearsal_buffer, device, classes_per_task, global_step, config):
+    print(f"\n🧠 WAKE PHASE: Learning new Task {current_task_id}...")
     model.train()
-    hook_handles = apply_masks_and_hooks(model, current_task_id, [])
-    patience = config["patience"]
-    min_delta = config["min_delta_loss"]
-    lambda_max = config["lambda_max"]
-    lambda_min = config["lambda_min"]
-    bonus_max = config["attention_bonus_max"]
-    lambda_decay_epochs = config["lambda_decay_epochs"]
-    patience_counter = 0
-    best_loss = float('inf')
-    epoch = 0
-    last_epoch_features = []
-    last_epoch_losses = []
+    
+    for param in model.continual_learning_params(): param.requires_grad = False
+    for param in model.separation_layer_params(): param.requires_grad = True
+    for param in model.mlp_heads[current_task_id].parameters(): param.requires_grad = True
 
-    print(f"🚀 Starting training for model task {current_task_id} (patience={patience}, lambda: {lambda_max} -> {lambda_min}).")
-    while patience_counter < patience:
-        loop = tqdm(train_loader, leave=True)
-        epoch_loss = 0.0
-        num_batches = 0
-        decay_factor = max(0, (1 - epoch / lambda_decay_epochs))
-        # current_lambda = lambda_min + (lambda_max - lambda_min) * decay_factor
-        current_attention_bonus = bonus_max * decay_factor
-        current_lambda = lambda_max
-
-        if patience_counter == 1: 
-             last_epoch_features.clear()
-             last_epoch_losses.clear()
-
-        
-        for batch_idx, (data, target) in enumerate(loop):
-
+    recon_criterion = nn.MSELoss()
+    for epoch in range(config["wake_epochs"]):
+        loop = tqdm(train_loader, leave=False, desc=f"WAKE Epoch {epoch+1}/{config['wake_epochs']}")
+        for data, target in loop:
             data, target = data.to(device), target.to(device)
-            target = target - current_task_id * classes_per_task
-            # optimizer.zero_grad()
-            # optimizer.zero_grad(set_to_none=True)
-            optimizer_main.zero_grad(set_to_none=True)
-            optimizer_proj.zero_grad(set_to_none=True)
+            optimizer_sep_ae.zero_grad(); optimizer_head.zero_grad()
             
-            output, current_features = model(data, current_task_id, current_attention_bonus=current_attention_bonus, return_features=True)
-            task_loss = criterion(output, target)
-
+            output, resnet_feats, separated_feats, recon_feats = model(data, current_task_id)
+            
+            # Loss 1: Classification for the new task
+            class_loss = criterion(output, target - current_task_id * classes_per_task)
+            # Loss 2: Reconstruction to preserve information
+            recon_loss = recon_criterion(recon_feats, resnet_feats)
+            # Loss 3: Orthogonality against past tasks
             ortho_loss = 0.0
-            if current_task_id > 0:
-                ortho_loss = calculate_orthogonality_loss(model.growing_transformer)
-
-            sep_loss = 0.0
-            past_features = rehearsal_buffer.sample(data.size(0))
-            if past_features is not None:
-                past_features = past_features.to(device)
-                sep_loss = separation_loss_fn(current_features, past_features)
-
-            total_loss = task_loss + current_lambda * ortho_loss 
-            total_loss.backward(retain_graph=True)
-
-            if isinstance(sep_loss, torch.Tensor):
-                sep_loss.backward()
-
-            optimizer_main.step()
-            optimizer_proj.step()
-
-            epoch_loss += total_loss.item()
-            num_batches += 1
+            _, past_separated_feats, _ = rehearsal_buffer.sample(data.size(0))
+            if past_separated_feats is not None:
+                past_separated_feats = past_separated_feats.to(device)
+                combined_separated_feats = torch.cat([separated_feats, past_separated_feats], dim=0)
+                ortho_loss = calculate_feature_orthogonality_loss(combined_separated_feats)
+            
+            total_loss = class_loss + config["lambda_recon"] * recon_loss + config["lambda_feat_ortho"] * ortho_loss
+            total_loss.backward()
+            optimizer_sep_ae.step(); optimizer_head.step()
             global_step += 1
-            if WANDB_AVAILABLE:
-                log_data = {
-                    "task_loss": task_loss.item(), "total_loss": total_loss.item(),
-                    "model_task_id": current_task_id, "epoch": epoch, "global_step": global_step,
-                    "current_lambda": current_lambda
-                }
-                if current_task_id > 0:
-                    log_data["ortho_loss"] = ortho_loss.item() if isinstance(ortho_loss, torch.Tensor) else ortho_loss
-                    log_data["sep_loss"] = sep_loss.item() if isinstance(sep_loss, torch.Tensor) else sep_loss
-                wandb.log(log_data)
-            loop.set_description(f"Data Task {config['data_task_idx']} | Model Task {current_task_id} | Epoch {epoch+1}")
-            loop.set_postfix(loss=total_loss.item(), ortho=f"{ortho_loss.item() if isinstance(ortho_loss, torch.Tensor) else 0:.4f}", lambda_o=f"{current_lambda:.4f}", sep_loss=f"{sep_loss.item() if isinstance(sep_loss, torch.Tensor) else 0:4f}")
+            loop.set_postfix(loss=total_loss.item(), cls=class_loss.item(), rec=recon_loss.item(), ort=ortho_loss.item() if isinstance(ortho_loss, torch.Tensor) else 0)
 
-            if patience_counter == 1:
-                last_epoch_features.append(current_features.detach().cpu())
-                # We need per-sample loss, so we compute it here again without reduction
-                per_sample_loss = nn.CrossEntropyLoss(reduction='none')(output, target).detach().cpu()
-                last_epoch_losses.append(per_sample_loss)
+    for param in model.parameters(): param.requires_grad = True # Unfreeze for next phase
+        
+    model.eval()
+    all_resnet_feats, all_separated_feats, all_losses, all_labels = [], [], [], []
+    with torch.no_grad():
+        for data, target in train_loader:
+            data, target = data.to(device), target.to(device)
+            output, resnet_feats, separated_feats, _ = model(data, current_task_id)
+            per_sample_loss = nn.CrossEntropyLoss(reduction='none')(output, target - current_task_id * classes_per_task)
+            all_resnet_feats.append(resnet_feats.cpu())
+            all_separated_feats.append(separated_feats.cpu())
+            all_losses.append(per_sample_loss.cpu())
+            all_labels.append(target.cpu())
+            
+    return global_step, torch.cat(all_resnet_feats), torch.cat(all_separated_feats), torch.cat(all_losses), torch.cat(all_labels)
 
-        avg_epoch_loss = epoch_loss / num_batches if num_batches > 0 else float('inf')
-        print(f"\nEpoch {epoch+1} ended. Avg Total Loss: {avg_epoch_loss:.4f}. Best Loss: {best_loss:.4f}")
-        if avg_epoch_loss < best_loss - min_delta:
-            best_loss = avg_epoch_loss
-            patience_counter = 0
-            print(f"✅ Loss improved. Resetting patience counter.")
-        else:
-            patience_counter += 1
-            print(f"⚠️ Loss did not improve. Patience: {patience_counter}/{patience}")
-        epoch += 1
-        if patience_counter >= patience:
-            break
-    print(f"🏁 Loss plateaued after {epoch} epochs.")
 
-    final_features = torch.cat(last_epoch_features) if last_epoch_features else None
-    final_losses = torch.cat(last_epoch_losses) if last_epoch_losses else None
+def sleep_phase_consolidation(model, optimizers, criterion, rehearsal_buffer, device, global_step, config):
+    print(f"😴 SLEEP PHASE: Consolidating all learned knowledge...")
+    if not rehearsal_buffer.buffer:
+        print("Buffer is empty, skipping sleep phase."); return global_step
+        
+    model.train()
+    # Freeze the backbone, only train the separation layer and the tokenformer
+    for param in model.backbone.parameters(): param.requires_grad = False
+    
+    for epoch in range(config["sleep_epochs"]):
+        resnet_feats, _, labels = rehearsal_buffer.sample(config["buffer_size"])
+        if resnet_feats is None: continue
+        
+        buffer_dataset = TensorDataset(resnet_feats, labels)
+        buffer_loader = DataLoader(buffer_dataset, batch_size=config["batch_size"], shuffle=True)
+        
+        loop = tqdm(buffer_loader, leave=False, desc=f"SLEEP Epoch {epoch+1}/{config['sleep_epochs']}")
+        for resnet_f, label_g in loop:
+            resnet_f, label_g = resnet_f.to(device), label_g.to(device)
+            for opt in optimizers: opt.zero_grad()
+            
+            # Pass replayed ResNet features through the rest of the model
+            separated_f, recon_f = model.separation_autoencoder(resnet_f)
+            b, n, _ = separated_f.shape
+            cls_tokens = repeat(model.cls_token, '1 1 d -> b 1 d', b=b)
+            tokens = torch.cat((cls_tokens, separated_f), dim=1) + model.pos_embedding
+            cls_output = model.growing_transformer(tokens)[:, 0]
 
-    for handle in hook_handles:
-        handle.remove()
-    return optimizer_main, optimizer_proj, global_step, final_features, final_losses
+            # Calculate losses
+            ortho_loss = calculate_feature_orthogonality_loss(torch.mean(separated_f, dim=1))
+            
+            # Classification loss requires routing to the correct head
+            class_loss = 0.0
+            unique_tasks_in_batch = torch.unique(label_g // config["classes_per_task"])
+            for task_id in unique_tasks_in_batch:
+                mask = (label_g // config["classes_per_task"] == task_id)
+                task_cls_output = cls_output[mask]
+                task_labels = label_g[mask]
+                
+                head_output = model.mlp_heads[task_id](task_cls_output)
+                class_loss += criterion(head_output, task_labels - task_id * config["classes_per_task"])
+
+            total_loss = config["lambda_feat_ortho_sleep"] * ortho_loss + class_loss
+            total_loss.backward()
+            for opt in optimizers: opt.step()
+            global_step += 1
+            loop.set_postfix(loss=total_loss.item(), ort=ortho_loss.item(), cls=class_loss.item())
+            
+    return global_step
+
 
 if __name__ == '__main__':
-    # ### NEW: Argument Parser for resuming ###
-    parser = argparse.ArgumentParser(description='Tokenformer Continual Learning')
-    parser.add_argument('--resume', default='', type=str, metavar='PATH',
-                        help='path to latest checkpoint (default: none)')
-    args = parser.parse_args()
+    parser = argparse.ArgumentParser(description='Tokenformer Continual Learning'); parser.add_argument('--resume', default='', type=str, metavar='PATH', help='path to latest checkpoint'); args = parser.parse_args()
 
     config = {
-        "num_tasks": 5,
-        "classes_per_task": 2,
-        "batch_size": 32,
-        "patience": 2,
-        "min_delta_loss": 0.01,
-        "lr": 1e-4,
-        "lambda_max": 1.0,
-        "lambda_min": 0.01,
-        "lambda_decay_epochs": 4,
-        # "attention_bonus": 1.0,
-        "attention_bonus_max": 0,
-        "data_task_idx": 0,
-        "lambda_sep": 10.0, 
-        "buffer_size": 500,
-        "samples_per_task": 10,
+        "num_tasks": 5, "classes_per_task": 2, "batch_size": 32, "lr": 1e-4,
+        "lambda_feat_ortho": 2.0, "lambda_recon": 0.5, "lambda_feat_ortho_sleep": 2.5,
+        "samples_per_task": 20, "buffer_size": 200,
+        "wake_epochs": 5, "sleep_epochs": 3,
     }
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-    if WANDB_AVAILABLE:
-        wandb.init(project="tokenformer-resnet-cl", config=config)
-
-    model = ContinualLearner(
-        dim=128, depth=2, heads=4, mlp_dim=256,
-        num_tasks=config["num_tasks"], classes_per_task=config["classes_per_task"],
-        device=DEVICE,
-        attention_bonus_max=config["attention_bonus_max"],
-    ).to(DEVICE)
-    
+    model = ContinualLearner(dim=128, depth=2, heads=4, mlp_dim=256, num_tasks=config["num_tasks"], classes_per_task=config["classes_per_task"], device=DEVICE).to(DEVICE)
     train_loaders, test_loaders = get_split_mnist_loaders(config["num_tasks"], config["classes_per_task"], config["batch_size"])
     criterion = nn.CrossEntropyLoss()
-    # optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=config["lr"])
-    optimizer_main = torch.optim.Adam(model.continual_learning_params(), lr=config["lr"])
-    optimizer_proj = torch.optim.Adam(model.projection_head_params(), lr=config["lr"])
     rehearsal_buffer = CuratedRehearsalBuffer(samples_per_task=config["samples_per_task"])
 
-    # ### NEW: Initialize state variables and load checkpoint if provided ###
-    start_task_idx = 0
-    global_step = 0
-    current_task_id = 0
-    results_history = {}
+    start_task_idx, global_step, current_task_id, results_history = 0, 0, 0, {}
 
-    if args.resume:
-        model, start_task_idx, global_step, results_history, optimizers_state_dict = load_checkpoint(model, args.resume)
-        if optimizers_state_dict:
-            optimizer_main.load_state_dict(optimizers_state_dict['main'])
-            optimizer_proj.load_state_dict(optimizers_state_dict['proj'])
-        current_task_id = start_task_idx - 1 if start_task_idx > 0 else 0
+    if args.resume: model, start_task_idx, global_step, results_history = load_checkpoint(model, args.resume)
+    current_task_id = start_task_idx - 1 if start_task_idx > 0 else 0
     
     print(f"Total model parameters: {count_parameters(model):,}")
-    print(f"Trainable parameters: {count_parameters(model, trainable_only=True):,}")
 
-    # ### MODIFIED: Main loop starts from the correct task index ###
     for data_task_idx in range(start_task_idx, config["num_tasks"]):
-        print(f"\n--- Presenting Data from Task {data_task_idx} (Model is on Task {current_task_id}) ---")
-        config["data_task_idx"] = data_task_idx
-
-        if data_task_idx > current_task_id and data_task_idx > 0:
-             current_task_id += 1
-             model.grow()
-             print(f"Trainable parameters after growth: {count_parameters(model, trainable_only=True):,}")
-            #  optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=config["lr"])
-             optimizer_main = torch.optim.Adam(model.continual_learning_params(), lr=config["lr"])
-             optimizer_proj = torch.optim.Adam(model.projection_head_params(), lr=config["lr"])
-             if WANDB_AVAILABLE:
-                 wandb.log({"growth_event": 1, "model_task_id": current_task_id, "global_step": global_step, "trainable_parameters": count_parameters(model, trainable_only=True)})
+        print(f"\n{'='*20} Task {data_task_idx} {'='*20}")
+        current_task_id = data_task_idx
+        if data_task_idx > 0: model.grow()
         
-        optimizer_main, optimizer_proj, global_step, final_features, final_losses = train_until_plateau(
-            model, current_task_id, train_loaders[data_task_idx], optimizer_main, optimizer_proj, criterion, rehearsal_buffer, DEVICE, 
-            config["classes_per_task"], global_step, config
-        )
+        # Define optimizers for each phase
+        optimizer_sep_ae = torch.optim.Adam(model.separation_layer_params(), lr=config["lr"])
+        optimizer_head_current = torch.optim.Adam(model.mlp_heads[current_task_id].parameters(), lr=config["lr"])
+        optimizer_main = torch.optim.Adam(model.continual_learning_params(), lr=config["lr"])
         
-        rehearsal_buffer.add_task_samples(current_task_id, final_features, final_losses)
+        # --- PHASE 1: WAKE ---
+        global_step, res_feats, sep_feats, losses, labels = wake_phase_training(
+            model, current_task_id, train_loaders[data_task_idx], optimizer_sep_ae, optimizer_head_current, 
+            criterion, rehearsal_buffer, DEVICE, config["classes_per_task"], global_step, config)
+        rehearsal_buffer.add_task_samples(current_task_id, res_feats, sep_feats, losses, labels)
 
-        print(f"--- Finished Training on Data Task {data_task_idx} ---")
+        # --- PHASE 2: SLEEP ---
+        if data_task_idx > 0:
+            global_step = sleep_phase_consolidation(
+                model, [optimizer_main, optimizer_sep_ae], criterion, 
+                rehearsal_buffer, DEVICE, global_step, config)
+
+        print(f"\n--- Evaluating after Task {data_task_idx} ---")
         accuracies = evaluate(model, test_loaders, DEVICE, current_task_id + 1, config["classes_per_task"])
-        
-        # ### NEW: Store results and save checkpoint ###
         results_history[current_task_id] = accuracies
-        
-        state_to_save = {
-            'current_task_id': current_task_id,
-            'global_step': global_step,
-            'model_state_dict': model.state_dict(),
-            'optimizers_state_dict': {
-                'main': optimizer_main.state_dict(),
-                'proj': optimizer_proj.state_dict(),
-            },
-            'results_history': results_history,
-        }
-        save_checkpoint(state_to_save, filename=f"checkpoint_task_{current_task_id}_final.pth.tar")
+        save_checkpoint({
+            'current_task_id': current_task_id, 'global_step': global_step,
+            'model_state_dict': model.state_dict(), 'results_history': results_history}, 
+            filename=f"checkpoint_task_{current_task_id}_final.pth.tar")
 
-    # ### NEW: Print final results table ###
     print_results_table(results_history, config["num_tasks"])
-
-    if WANDB_AVAILABLE:
-        wandb.summary["final_average_accuracy"] = np.mean(results_history.get(config["num_tasks"] - 1, [0]))
-        wandb.summary["final_trainable_parameters"] = count_parameters(model, trainable_only=True)
-        wandb.finish()
