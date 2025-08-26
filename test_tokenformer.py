@@ -41,12 +41,12 @@ def visualize_routing_attention(model, image, label, task_id):
     routing_layer = model.growing_transformer.layers[0][1].pattn2
 
     # Perform a forward pass to populate the attention weights
-    outputs, feat = model(image.unsqueeze(0), task_id=task_id, training=False, return_features=True) # Add batch dimension
+    outputs = model(image.unsqueeze(0), task_id=task_id, training=False, return_features=True) # Add batch dimension
     print(nn.Softmax()(outputs[0]))
 
     # Get the attention weights for the CLS token (at sequence position 0)
     # The shape is (1, 1, num_param_tokens) -> squeeze to (num_param_tokens)
-    print(routing_layer.attn_weights.shape, feat.shape)
+    # print(routing_layer.attn_weights.shape, feat.shape)
     attn_scores = routing_layer.attn_weights[0, 0, :].cpu().detach().numpy()
 
     # Get the boundaries of the parameters for each task
@@ -68,7 +68,7 @@ def visualize_routing_attention(model, image, label, task_id):
     plt.tight_layout()
     plt.savefig(f"attention_visualization_task_{task_id}_label_{label}.png")
     # plt.show()
-    return feat
+    # return feat
 
 
 if __name__ == '__main__':
@@ -94,13 +94,13 @@ if __name__ == '__main__':
         image = image.to(DEVICE)
 
         print(f"Visualizing attention for an image of digit '{label}' from Task {task_id}...")
-        feat = visualize_routing_attention(model, image, label, task_id)
-        features.append(feat)
+        visualize_routing_attention(model, image, label, task_id)
+        # features.append(feat)
 
-    for f in range(len(features)):
-        for k in range(0, len(features)):
-            # print(torch.matmul(features[f], features[k].T)**2)
-            current_features = F.normalize(features[f], p=2, dim=1)
-            past_features = F.normalize(features[k], p=2, dim=1)
-            print(f"{f} vs {k}", torch.mean(torch.matmul(current_features, past_features.T)**2))
+    # for f in range(len(features)):
+    #     for k in range(0, len(features)):
+    #         # print(torch.matmul(features[f], features[k].T)**2)
+    #         current_features = F.normalize(features[f], p=2, dim=1)
+    #         past_features = F.normalize(features[k], p=2, dim=1)
+    #         print(f"{f} vs {k}", torch.mean(torch.matmul(current_features, past_features.T)**2))
 

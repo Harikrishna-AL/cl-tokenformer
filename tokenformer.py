@@ -167,40 +167,40 @@ def get_split_mnist_loaders(num_tasks, classes_per_task, batch_size):
         
     return train_loaders, test_loaders
 
-class CuratedRehearsalBuffer:
-    """
-    A buffer that stores a few of the hardest samples per task.
-    "Hardest" is defined as the samples with the highest loss.
-    """
-    def __init__(self, samples_per_task=5):
-        self.samples_per_task = samples_per_task
-        # Buffer is now a dictionary mapping task_id to a list of feature vectors
-        self.buffer = {}
+# class CuratedRehearsalBuffer:
+#     """
+#     A buffer that stores a few of the hardest samples per task.
+#     "Hardest" is defined as the samples with the highest loss.
+#     """
+#     def __init__(self, samples_per_task=5):
+#         self.samples_per_task = samples_per_task
+#         # Buffer is now a dictionary mapping task_id to a list of feature vectors
+#         self.buffer = {}
 
-    def add_task_samples(self, task_id, features, losses):
-        """Finds the k hardest samples and adds them to the buffer for the given task."""
-        if features is None or losses is None:
-            return
+#     def add_task_samples(self, task_id, features, losses):
+#         """Finds the k hardest samples and adds them to the buffer for the given task."""
+#         if features is None or losses is None:
+#             return
             
-        # Get the indices of the samples with the highest loss
-        _, top_k_indices = torch.topk(losses, k=min(self.samples_per_task, len(losses)))
+#         # Get the indices of the samples with the highest loss
+#         _, top_k_indices = torch.topk(losses, k=min(self.samples_per_task, len(losses)))
         
-        hardest_samples = features[top_k_indices].detach().cpu()
-        self.buffer[task_id] = hardest_samples
-        print(f"✅ Stored {len(hardest_samples)} hardest samples for Task {task_id} in the buffer.")
+#         hardest_samples = features[top_k_indices].detach().cpu()
+#         self.buffer[task_id] = hardest_samples
+#         print(f"✅ Stored {len(hardest_samples)} hardest samples for Task {task_id} in the buffer.")
 
-    def sample(self, batch_size):
-        """Samples a balanced batch from all past tasks in the buffer."""
-        if not self.buffer:
-            return None
+#     def sample(self, batch_size):
+#         """Samples a balanced batch from all past tasks in the buffer."""
+#         if not self.buffer:
+#             return None
         
-        all_past_samples = torch.cat(list(self.buffer.values()), dim=0)
+#         all_past_samples = torch.cat(list(self.buffer.values()), dim=0)
         
-        if len(all_past_samples) == 0:
-            return None
+#         if len(all_past_samples) == 0:
+#             return None
 
-        indices = np.random.choice(len(all_past_samples), size=min(batch_size, len(all_past_samples)), replace=False)
-        return all_past_samples[indices]
+#         indices = np.random.choice(len(all_past_samples), size=min(batch_size, len(all_past_samples)), replace=False)
+#         return all_past_samples[indices]
 
 def separation_loss_fn(current_features, past_features):
     """Pushes current features away from past features by minimizing cosine similarity."""
@@ -323,6 +323,8 @@ def train_until_plateau(model, current_task_id, train_loader, optimizer_main, op
     epoch = 0
     last_epoch_features = []
     last_epoch_losses = []
+    last_epoch_resnet_features = []
+    last_epoch_labels = []
     recon_criterion = nn.MSELoss()
 
     print(f"🚀 Starting training for model task {current_task_id} (patience={patience}, lambda: {lambda_max} -> {lambda_min}).")
@@ -356,16 +358,17 @@ def train_until_plateau(model, current_task_id, train_loader, optimizer_main, op
             if current_task_id > 0:
                 ortho_loss = calculate_orthogonality_loss(model.growing_transformer)
 
-            sep_loss = 0.0
-            past_features = rehearsal_buffer.sample(data.size(0))
-            if past_features is not None:
-                past_features = past_features.to(device)
-                sep_loss += separation_loss_fn(sep_feats, past_features)
-            
             rec_loss = 0.0
             rec_loss = recon_criterion(recon_feats, resnet_feats)
 
-            total_loss = task_loss + current_lambda * ortho_loss + config["lambda_recon"]*rec_loss
+            sep_loss = 0.0
+            _, past_features, _ = rehearsal_buffer.sample(data.size(0))
+            if past_features is not None:
+                past_features = past_features.to(device)
+                sep_loss += separation_loss_fn(sep_feats, past_features)
+            sep_loss += config["lambda_recon"]*rec_loss
+
+            total_loss = task_loss + current_lambda * ortho_loss 
             total_loss.backward(retain_graph=True)
 
             if isinstance(sep_loss, torch.Tensor):
@@ -388,10 +391,12 @@ def train_until_plateau(model, current_task_id, train_loader, optimizer_main, op
                     log_data["sep_loss"] = sep_loss.item() if isinstance(sep_loss, torch.Tensor) else sep_loss
                 wandb.log(log_data)
             loop.set_description(f"Data Task {config['data_task_idx']} | Model Task {current_task_id} | Epoch {epoch+1}")
-            loop.set_postfix(loss=total_loss.item(), ortho=f"{ortho_loss.item() if isinstance(ortho_loss, torch.Tensor) else 0:.4f}", lambda_o=f"{current_lambda:.4f}", sep_loss=f"{sep_loss.item() if isinstance(sep_loss, torch.Tensor) else 0:4f}", rec=recon_loss.item())
+            loop.set_postfix(loss=total_loss.item(), ortho=f"{ortho_loss.item() if isinstance(ortho_loss, torch.Tensor) else 0:.4f}", lambda_o=f"{current_lambda:.4f}", sep_loss=f"{sep_loss.item() if isinstance(sep_loss, torch.Tensor) else 0:4f}", rec=rec_loss.item())
 
             if patience_counter == 1:
-                last_epoch_features.append(current_features.detach().cpu())
+                last_epoch_features.append(sep_feats.detach().cpu())
+                last_epoch_resnet_features.append(resnet_feats.detach().cpu())
+                last_epoch_labels.append(target.cpu())
                 # We need per-sample loss, so we compute it here again without reduction
                 per_sample_loss = nn.CrossEntropyLoss(reduction='none')(output, target).detach().cpu()
                 last_epoch_losses.append(per_sample_loss)
@@ -412,10 +417,12 @@ def train_until_plateau(model, current_task_id, train_loader, optimizer_main, op
 
     final_features = torch.cat(last_epoch_features) if last_epoch_features else None
     final_losses = torch.cat(last_epoch_losses) if last_epoch_losses else None
+    final_resnet_features = torch.cat(last_epoch_resnet_features) if last_epoch_resnet_features else None
+    final_labels = torch.cat(last_epoch_labels) if last_epoch_labels else None
 
     for handle in hook_handles:
         handle.remove()
-    return optimizer_main, optimizer_proj, global_step, final_features, final_losses
+    return optimizer_main, optimizer_proj, global_step, final_features, final_losses, final_resnet_features, final_labels
 
 if __name__ == '__main__':
     # ### NEW: Argument Parser for resuming ###
@@ -440,6 +447,7 @@ if __name__ == '__main__':
         "lambda_sep": 10.0, 
         "buffer_size": 500,
         "samples_per_task": 10,
+        "lambda_recon" : 0.5
     }
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -487,16 +495,16 @@ if __name__ == '__main__':
              print(f"Trainable parameters after growth: {count_parameters(model, trainable_only=True):,}")
             #  optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=config["lr"])
              optimizer_main = torch.optim.Adam(model.continual_learning_params(), lr=config["lr"])
-             optimizer_proj = torch.optim.Adam(model.separation_autoencoder, lr=config["lr"])
+             optimizer_proj = torch.optim.Adam(model.projection_head_params(), lr=config["lr"])
              if WANDB_AVAILABLE:
                  wandb.log({"growth_event": 1, "model_task_id": current_task_id, "global_step": global_step, "trainable_parameters": count_parameters(model, trainable_only=True)})
         
-        optimizer_main, optimizer_proj, global_step, final_features, final_losses = train_until_plateau(
+        optimizer_main, optimizer_proj, global_step, final_features, final_losses, final_resnet_features, final_labels = train_until_plateau(
             model, current_task_id, train_loaders[data_task_idx], optimizer_main, optimizer_proj, criterion, rehearsal_buffer, DEVICE, 
             config["classes_per_task"], global_step, config
         )
         
-        rehearsal_buffer.add_task_samples(current_task_id, final_features, final_losses)
+        rehearsal_buffer.add_task_samples(current_task_id, final_resnet_features, final_features, final_losses, final_labels)
 
         print(f"--- Finished Training on Data Task {data_task_idx} ---")
         accuracies = evaluate(model, test_loaders, DEVICE, current_task_id + 1, config["classes_per_task"])

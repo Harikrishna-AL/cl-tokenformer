@@ -10,6 +10,30 @@ from einops import rearrange, repeat
 
 # PattentionLayer, TokenformerFeedForward, TokenformerAttention, TokenformerEncoder
 # are unchanged. They are the core building blocks.
+class SeparationAutoencoder(nn.Module):
+    """
+    An autoencoder that learns to create a separated feature representation.
+    - The encoder is the "separation layer".
+    - The decoder is used to enforce a reconstruction loss, ensuring the
+      encoded features remain informative.
+    """
+    def __init__(self, input_dim, hidden_dim, separated_dim):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, separated_dim)
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(separated_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, input_dim)
+        )
+
+    def forward(self, x):
+        separated_features = self.encoder(x)
+        reconstructed_features = self.decoder(separated_features)
+        return separated_features, reconstructed_features
 
 class ProjectionHead(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):
@@ -197,7 +221,10 @@ class ContinualLearner(nn.Module):
 
     def projection_head_params(self):
         """Returns an iterator over the projection head's parameters."""
-        return self.projection_head.parameters()
+        # return self.separation_autoencoder.parameters()
+        for name, param in self.separation_autoencoder.named_parameters():
+            if param.requires_grad:
+                yield param
         
     def continual_learning_params(self):
         """
@@ -224,8 +251,8 @@ class ContinualLearner(nn.Module):
         output_sequence = self.growing_transformer(tokens, task_id, current_attention_bonus, training=training)
         cls_output = output_sequence[:, 0]
         
-        if return_features:
-            return self.mlp_heads[task_id](cls_output), project_feature_vect
+        # if return_features:
+        #     return self.mlp_heads[task_id](cls_output), project_feature_vect
         
         # if training == False or return_features:
         #     outputs = []
@@ -235,7 +262,10 @@ class ContinualLearner(nn.Module):
         #     outputs = torch.cat(outputs, dim=1)
         #     return outputs, project_feature_vect
 
-        return self.mlp_heads[task_id](cls_output), patch_embeddings, separated_feature_vector, reconstructed_features_sequence
+        if training:
+            return self.mlp_heads[task_id](cls_output), patch_embeddings, project_feature_vect, reconstructed_features_sequence
+        else:
+            return self.mlp_heads[task_id](cls_output)
 
     def grow(self):
         print("\n--- Growing Model (Tokenformer Encoder) ---")
