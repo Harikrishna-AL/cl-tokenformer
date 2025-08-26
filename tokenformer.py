@@ -448,9 +448,9 @@ def sleep_phase_consolidation(model, optimizer_sep_ae, rehearsal_buffer, device,
             separated_f_output, recon_f = model.separation_autoencoder(resnet_f)
             
             recon_loss = recon_criterion(recon_f, resnet_f)
-            ortho_loss = calculate_feature_orthogonality_loss(separated_f_output)
+            ortho_loss = separation_loss_fn(separated_f_output, separated_f_target)
             
-            total_loss = config["lambda_recon_sleep"] * recon_loss + config["lambda_feat_ortho_sleep"] * ortho_loss
+            total_loss = config["lambda_recon"] * recon_loss + config["lambda_sep"] * ortho_loss
             total_loss.backward()
             optimizer_sep_ae.step()
             loop.set_postfix(loss=total_loss.item(), rec=recon_loss.item(), ort=ortho_loss.item())

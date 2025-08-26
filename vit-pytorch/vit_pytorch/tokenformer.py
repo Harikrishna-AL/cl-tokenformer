@@ -265,7 +265,12 @@ class ContinualLearner(nn.Module):
         if training:
             return self.mlp_heads[task_id](cls_output), patch_embeddings, project_feature_vect, reconstructed_features_sequence
         else:
-            return self.mlp_heads[task_id](cls_output)
+            outputs = []
+            for o in range(self.num_tasks):
+                out = self.mlp_heads[o](cls_output)
+                outputs.append(out)
+            outputs = torch.cat(outputs, dim=1)
+            return outputs
 
     def grow(self):
         print("\n--- Growing Model (Tokenformer Encoder) ---")

@@ -42,7 +42,8 @@ def visualize_routing_attention(model, image, label, task_id):
 
     # Perform a forward pass to populate the attention weights
     outputs = model(image.unsqueeze(0), task_id=task_id, training=False, return_features=True) # Add batch dimension
-    print(nn.Softmax()(outputs[0]))
+    print(outputs)
+    print(torch.argmax(nn.Softmax()(outputs)))
 
     # Get the attention weights for the CLS token (at sequence position 0)
     # The shape is (1, 1, num_param_tokens) -> squeeze to (num_param_tokens)
