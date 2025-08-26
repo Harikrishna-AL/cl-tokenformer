@@ -254,6 +254,37 @@ def apply_masks_and_hooks(model, current_task_id, previous_handles):
             ))
     return new_handles
 
+class CuratedRehearsalBuffer:
+    def __init__(self, samples_per_task=10):
+        self.samples_per_task = samples_per_task
+        self.buffer = {} # Maps task_id to a tuple of (resnet_features, separated_features, labels)
+
+    def add_task_samples(self, task_id, resnet_features, separated_features, losses, labels):
+        if resnet_features is None or separated_features is None or losses is None or labels is None:
+            return
+        _, top_k_indices = torch.topk(losses, k=min(self.samples_per_task, len(losses)))
+        
+        self.buffer[task_id] = (
+            resnet_features[top_k_indices].detach().cpu(),
+            separated_features[top_k_indices].detach().cpu(),
+            labels[top_k_indices].detach().cpu()
+        )
+        print(f"✅ Stored {len(top_k_indices)} hardest samples for Task {task_id} in the buffer.")
+
+    def sample(self, batch_size):
+        if not self.buffer:
+            return None, None, None
+        
+        all_resnet_feats = torch.cat([item[0] for item in self.buffer.values()], dim=0)
+        all_separated_feats = torch.cat([item[1] for item in self.buffer.values()], dim=0)
+        all_labels = torch.cat([item[2] for item in self.buffer.values()], dim=0)
+        
+        if len(all_resnet_feats) == 0:
+            return None, None, None
+
+        indices = np.random.choice(len(all_resnet_feats), size=min(batch_size, len(all_resnet_feats)), replace=False)
+        return all_resnet_feats[indices], all_separated_feats[indices], all_labels[indices]
+
 def calculate_orthogonality_loss(growing_module):
     ortho_loss = 0.0
     num_layers = 0
@@ -292,6 +323,7 @@ def train_until_plateau(model, current_task_id, train_loader, optimizer_main, op
     epoch = 0
     last_epoch_features = []
     last_epoch_losses = []
+    recon_criterion = nn.MSELoss()
 
     print(f"🚀 Starting training for model task {current_task_id} (patience={patience}, lambda: {lambda_max} -> {lambda_min}).")
     while patience_counter < patience:
@@ -317,7 +349,7 @@ def train_until_plateau(model, current_task_id, train_loader, optimizer_main, op
             optimizer_main.zero_grad(set_to_none=True)
             optimizer_proj.zero_grad(set_to_none=True)
             
-            output, current_features = model(data, current_task_id, current_attention_bonus=current_attention_bonus, return_features=True)
+            output, resnet_feats, sep_feats, recon_feats = model(data, current_task_id, current_attention_bonus=current_attention_bonus, return_features=True)
             task_loss = criterion(output, target)
 
             ortho_loss = 0.0
@@ -328,9 +360,12 @@ def train_until_plateau(model, current_task_id, train_loader, optimizer_main, op
             past_features = rehearsal_buffer.sample(data.size(0))
             if past_features is not None:
                 past_features = past_features.to(device)
-                sep_loss = separation_loss_fn(current_features, past_features)
+                sep_loss += separation_loss_fn(sep_feats, past_features)
+            
+            rec_loss = 0.0
+            rec_loss = recon_criterion(recon_feats, resnet_feats)
 
-            total_loss = task_loss + current_lambda * ortho_loss 
+            total_loss = task_loss + current_lambda * ortho_loss + config["lambda_recon"]*rec_loss
             total_loss.backward(retain_graph=True)
 
             if isinstance(sep_loss, torch.Tensor):
@@ -353,7 +388,7 @@ def train_until_plateau(model, current_task_id, train_loader, optimizer_main, op
                     log_data["sep_loss"] = sep_loss.item() if isinstance(sep_loss, torch.Tensor) else sep_loss
                 wandb.log(log_data)
             loop.set_description(f"Data Task {config['data_task_idx']} | Model Task {current_task_id} | Epoch {epoch+1}")
-            loop.set_postfix(loss=total_loss.item(), ortho=f"{ortho_loss.item() if isinstance(ortho_loss, torch.Tensor) else 0:.4f}", lambda_o=f"{current_lambda:.4f}", sep_loss=f"{sep_loss.item() if isinstance(sep_loss, torch.Tensor) else 0:4f}")
+            loop.set_postfix(loss=total_loss.item(), ortho=f"{ortho_loss.item() if isinstance(ortho_loss, torch.Tensor) else 0:.4f}", lambda_o=f"{current_lambda:.4f}", sep_loss=f"{sep_loss.item() if isinstance(sep_loss, torch.Tensor) else 0:4f}", rec=recon_loss.item())
 
             if patience_counter == 1:
                 last_epoch_features.append(current_features.detach().cpu())
@@ -452,7 +487,7 @@ if __name__ == '__main__':
              print(f"Trainable parameters after growth: {count_parameters(model, trainable_only=True):,}")
             #  optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=config["lr"])
              optimizer_main = torch.optim.Adam(model.continual_learning_params(), lr=config["lr"])
-             optimizer_proj = torch.optim.Adam(model.projection_head_params(), lr=config["lr"])
+             optimizer_proj = torch.optim.Adam(model.separation_autoencoder, lr=config["lr"])
              if WANDB_AVAILABLE:
                  wandb.log({"growth_event": 1, "model_task_id": current_task_id, "global_step": global_step, "trainable_parameters": count_parameters(model, trainable_only=True)})
         

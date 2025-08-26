@@ -172,10 +172,15 @@ class ContinualLearner(nn.Module):
         for param in self.backbone.parameters():
             param.requires_grad = False
         # self.adapter = nn.Linear(dim_backbone, dim)
-        self.projection_head = ProjectionHead(
+        # self.projection_head = ProjectionHead(
+        #     input_dim=dim_backbone,
+        #     hidden_dim=dim_backbone,
+        #     output_dim=dim # Project to the Tokenformer's dimension
+        # )
+        self.separation_autoencoder = SeparationAutoencoder(
             input_dim=dim_backbone,
             hidden_dim=dim_backbone,
-            output_dim=dim # Project to the Tokenformer's dimension
+            separated_dim=dim # The separated dimension matches Tokenformer's dimension
         )
 
         # self.adapter = PattentionLayer(dim_backbone, dim, num_param_tokens=dim, device=device)
@@ -208,11 +213,11 @@ class ContinualLearner(nn.Module):
         feature_map = self.backbone(img)['features']
         patch_embeddings = rearrange(feature_map, 'b d h w -> b (h w) d')
         # adapted_embeddings = self.adapter(patch_embeddings, attention_bonus=current_attention_bonus, training=training)
-        projected_features = self.projection_head(patch_embeddings)
-        project_feature_vect = torch.mean(projected_features, dim=1)
-        b, n, _ = projected_features.shape
+        separated_features_sequence, reconstructed_features_sequence = self.separation_autoencoder(patch_embeddings)
+        project_feature_vect = torch.mean(separated_features_sequence, dim=1)
+        b, n, _ = separated_features_sequence.shape
         cls_tokens = repeat(self.cls_token, '1 1 d -> b 1 d', b=b)
-        tokens = torch.cat((cls_tokens, projected_features), dim=1)
+        tokens = torch.cat((cls_tokens, separated_features_sequence), dim=1)
         tokens += self.pos_embedding
         
         # Pass the task_id AND bonus down to the encoder during training
@@ -230,7 +235,7 @@ class ContinualLearner(nn.Module):
         #     outputs = torch.cat(outputs, dim=1)
         #     return outputs, project_feature_vect
 
-        return self.mlp_heads[task_id](cls_output)
+        return self.mlp_heads[task_id](cls_output), patch_embeddings, separated_feature_vector, reconstructed_features_sequence
 
     def grow(self):
         print("\n--- Growing Model (Tokenformer Encoder) ---")
