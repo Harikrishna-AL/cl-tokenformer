@@ -424,6 +424,38 @@ def train_until_plateau(model, current_task_id, train_loader, optimizer_main, op
         handle.remove()
     return optimizer_main, optimizer_proj, global_step, final_features, final_losses, final_resnet_features, final_labels
 
+
+def sleep_phase_consolidation(model, optimizer_sep_ae, rehearsal_buffer, device, config):
+    print(f"😴 SLEEP PHASE: Consolidating Separation Layer knowledge...")
+    if not rehearsal_buffer.buffer:
+        print("Buffer is empty, skipping sleep phase."); return
+
+    model.separation_autoencoder.train()
+    recon_criterion = nn.MSELoss()
+    for epoch in range(config["sleep_epochs"]):
+        resnet_feats, separated_feats, _ = rehearsal_buffer.sample(config["buffer_size"])
+        if resnet_feats is None: continue
+        
+        buffer_dataset = TensorDataset(resnet_feats, separated_feats)
+        buffer_loader = DataLoader(buffer_dataset, batch_size=config["batch_size"], shuffle=True)
+        
+        loop = tqdm(buffer_loader, leave=False, desc=f"SLEEP Epoch {epoch+1}/{config['sleep_epochs']}")
+    
+        for resnet_f, separated_f_target in loop:
+            resnet_f, separated_f_target = resnet_f.to(device), separated_f_target.to(device)
+            optimizer_sep_ae.zero_grad()
+
+            separated_f_output, recon_f = model.separation_autoencoder(resnet_f)
+            
+            recon_loss = recon_criterion(recon_f, resnet_f)
+            ortho_loss = calculate_feature_orthogonality_loss(separated_f_output)
+            
+            total_loss = config["lambda_recon_sleep"] * recon_loss + config["lambda_feat_ortho_sleep"] * ortho_loss
+            total_loss.backward()
+            optimizer_sep_ae.step()
+            loop.set_postfix(loss=total_loss.item(), rec=recon_loss.item(), ort=ortho_loss.item())
+    
+
 if __name__ == '__main__':
     # ### NEW: Argument Parser for resuming ###
     parser = argparse.ArgumentParser(description='Tokenformer Continual Learning')
@@ -447,7 +479,8 @@ if __name__ == '__main__':
         "lambda_sep": 10.0, 
         "buffer_size": 500,
         "samples_per_task": 10,
-        "lambda_recon" : 0.5
+        "lambda_recon" : 0.5,
+        "sleep_epochs": 3,
     }
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -505,6 +538,10 @@ if __name__ == '__main__':
         )
         
         rehearsal_buffer.add_task_samples(current_task_id, final_resnet_features, final_features, final_losses, final_labels)
+
+        if data_task_idx > 0:
+            sleep_phase_consolidation(
+                model, optimizer_proj, rehearsal_buffer, DEVICE, config)
 
         print(f"--- Finished Training on Data Task {data_task_idx} ---")
         accuracies = evaluate(model, test_loaders, DEVICE, current_task_id + 1, config["classes_per_task"])
