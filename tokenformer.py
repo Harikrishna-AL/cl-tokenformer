@@ -271,13 +271,29 @@ class CuratedRehearsalBuffer:
         )
         print(f"✅ Stored {len(top_k_indices)} hardest samples for Task {task_id} in the buffer.")
 
-    def sample(self, batch_size):
+    def sample(self, batch_size, exclude_task_id=None):
+        """
+        Samples a batch from the buffer.
+        If exclude_task_id is provided, it samples from all tasks EXCEPT that one.
+        """
         if not self.buffer:
             return None, None, None
         
-        all_resnet_feats = torch.cat([item[0] for item in self.buffer.values()], dim=0)
-        all_separated_feats = torch.cat([item[1] for item in self.buffer.values()], dim=0)
-        all_labels = torch.cat([item[2] for item in self.buffer.values()], dim=0)
+        # --- EDITED LOGIC ---
+        # Collect features and labels from relevant tasks
+        tasks_to_sample_from = []
+        for task_id, data in self.buffer.items():
+            if exclude_task_id is None or task_id != exclude_task_id:
+                tasks_to_sample_from.append(data)
+
+        if not tasks_to_sample_from:
+            return None, None, None
+
+        # Concatenate data from the selected tasks
+        all_resnet_feats = torch.cat([item[0] for item in tasks_to_sample_from], dim=0)
+        all_separated_feats = torch.cat([item[1] for item in tasks_to_sample_from], dim=0)
+        all_labels = torch.cat([item[2] for item in tasks_to_sample_from], dim=0)
+        # --- END EDITED LOGIC ---
         
         if len(all_resnet_feats) == 0:
             return None, None, None
@@ -425,7 +441,7 @@ def train_until_plateau(model, current_task_id, train_loader, optimizer_main, op
     return optimizer_main, optimizer_proj, global_step, final_features, final_losses, final_resnet_features, final_labels
 
 
-def sleep_phase_consolidation(model, optimizer_sep_ae, rehearsal_buffer, device, config):
+def sleep_phase_consolidation(model, optimizer_sep_ae, rehearsal_buffer, device, config, task_id):
     print(f"😴 SLEEP PHASE: Consolidating Separation Layer knowledge...")
     if not rehearsal_buffer.buffer:
         print("Buffer is empty, skipping sleep phase."); return
@@ -433,7 +449,7 @@ def sleep_phase_consolidation(model, optimizer_sep_ae, rehearsal_buffer, device,
     model.separation_autoencoder.train()
     recon_criterion = nn.MSELoss()
     for epoch in range(config["sleep_epochs"]):
-        resnet_feats, separated_feats, _ = rehearsal_buffer.sample(config["buffer_size"])
+        resnet_feats, separated_feats, _ = rehearsal_buffer.sample(config["buffer_size"], exclude_task_id=task_id)
         if resnet_feats is None: continue
         
         buffer_dataset = TensorDataset(resnet_feats, separated_feats)
@@ -470,7 +486,7 @@ if __name__ == '__main__':
         "patience": 2,
         "min_delta_loss": 0.01,
         "lr": 1e-4,
-        "lambda_max": 1.0,
+        "lambda_max": 10.0,
         "lambda_min": 0.01,
         "lambda_decay_epochs": 4,
         # "attention_bonus": 1.0,
@@ -479,7 +495,7 @@ if __name__ == '__main__':
         "lambda_sep": 10.0, 
         "buffer_size": 500,
         "samples_per_task": 10,
-        "lambda_recon" : 0.5,
+        "lambda_recon" : 1.0,
         "sleep_epochs": 3,
     }
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -541,7 +557,7 @@ if __name__ == '__main__':
 
         if data_task_idx > 0:
             sleep_phase_consolidation(
-                model, optimizer_proj, rehearsal_buffer, DEVICE, config)
+                model, optimizer_proj, rehearsal_buffer, DEVICE, config, data_task_idx)
 
         print(f"--- Finished Training on Data Task {data_task_idx} ---")
         accuracies = evaluate(model, test_loaders, DEVICE, current_task_id + 1, config["classes_per_task"])
