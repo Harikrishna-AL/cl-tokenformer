@@ -8,43 +8,8 @@ from torchvision.models.feature_extraction import create_feature_extractor
 
 from einops import rearrange, repeat
 
-# PattentionLayer, TokenformerFeedForward, TokenformerAttention, TokenformerEncoder
-# are unchanged. They are the core building blocks.
-class SeparationAutoencoder(nn.Module):
-    """
-    An autoencoder that learns to create a separated feature representation.
-    - The encoder is the "separation layer".
-    - The decoder is used to enforce a reconstruction loss, ensuring the
-      encoded features remain informative.
-    """
-    def __init__(self, input_dim, hidden_dim, separated_dim):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, separated_dim)
-        )
-        self.decoder = nn.Sequential(
-            nn.Linear(separated_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, input_dim)
-        )
-
-    def forward(self, x):
-        separated_features = self.encoder(x)
-        reconstructed_features = self.decoder(separated_features)
-        return separated_features, reconstructed_features
-
-class ProjectionHead(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim)
-        )
-    def forward(self, x):
-        return self.net(x)
+# NOTE: The core Tokenformer building blocks (PattentionLayer, TokenformerFeedForward, 
+# TokenformerAttention, TokenformerEncoder) are unchanged and included for completeness.
 
 class PattentionLayer(nn.Module):
     def __init__(self, dim_in, dim_out, num_param_tokens, device='cpu'):
@@ -64,11 +29,10 @@ class PattentionLayer(nn.Module):
 
     def forward(self, x, task_id=-1, attention_bonus=0.0, training=True):
         if self.key_param_tokens.shape[0] == 0:
-            # ... (empty layer handling is the same) ...
             return torch.zeros(x.shape[:-1] + (self.value_param_tokens.shape[1],), device=self.device)
 
         similarity = torch.matmul(x, self.key_param_tokens.T) * self.scale
-        # ### NEW: Apply the Attention Bonus during Training ###
+        
         if training and task_id > 0:
             bonus = torch.zeros_like(similarity)
             boundaries = [0] + self.growth_indices + [self.key_param_tokens.shape[0]]
@@ -77,10 +41,9 @@ class PattentionLayer(nn.Module):
                 start_idx = boundaries[task_id]
                 end_idx = boundaries[task_id + 1]
                 
-                # Add the bonus only to the similarity scores of the current task's params
-                if len(similarity.shape) == 3: # For sequence data (B, N, D)
+                if len(similarity.shape) == 3:
                     bonus[:, :, start_idx:end_idx] += attention_bonus
-                else: # For non-sequence data (B, D)
+                else:
                     bonus[:, start_idx:end_idx] += attention_bonus
                 
                 similarity = similarity + bonus
@@ -92,12 +55,11 @@ class PattentionLayer(nn.Module):
         return out
 
     def grow(self, num_new_tokens):
-        # ... (grow method is unchanged) ...
         dim_in = self.key_param_tokens.shape[1]
         dim_out = self.value_param_tokens.shape[1]
         num_old_tokens = self.key_param_tokens.shape[0]
         if num_old_tokens > 0:
-             self.growth_indices.append(num_old_tokens)
+              self.growth_indices.append(num_old_tokens)
         self.key_grad_mask.fill_(0)
         self.value_grad_mask.fill_(0)
         new_key_tokens = torch.randn(num_new_tokens, dim_in, device=self.device) * 0.01
@@ -109,7 +71,6 @@ class PattentionLayer(nn.Module):
         self.key_grad_mask = torch.cat([self.key_grad_mask, new_key_mask], dim=0)
         self.value_grad_mask = torch.cat([self.value_grad_mask, new_value_mask], dim=0)
 
-### --- Modules updated to pass task_id --- ###
 class TokenformerFeedForward(nn.Module):
     def __init__(self, dim, hidden_dim, ffn_num_param_tokens, dropout = 0., device='cpu', training=True):
         super().__init__()
@@ -151,7 +112,6 @@ class TokenformerAttention(nn.Module):
         q = self.to_q(x_norm, task_id, attention_bonus, training)
         k = self.to_k(x_norm, task_id, attention_bonus,training)
         v = self.to_v(x_norm, task_id, attention_bonus, training)
-        # ... (rest of the forward pass is the same) ...
         if q.shape[1] == 0: return torch.zeros_like(x)
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), (q, k, v))
         dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
@@ -178,113 +138,98 @@ class TokenformerEncoder(nn.Module):
             x = ff(x, task_id=task_id, attention_bonus=attention_bonus, training=training) + x
         return self.norm(x)
 
+class TaskRouter(nn.Module):
+    """
+    A recurrent router that performs iterative refinement to predict the task ID.
+    """
+    def __init__(self, input_dim, hidden_dim, num_tasks, num_steps=3):
+        super().__init__()
+        self.num_steps = num_steps
+        self.rnn = nn.GRU(input_dim, hidden_dim, batch_first=True)
+        self.fc = nn.Linear(hidden_dim, num_tasks)
+
+    def forward(self, x):
+        repeated_x = x.unsqueeze(1).repeat(1, self.num_steps, 1)
+        output, _ = self.rnn(repeated_x)
+        last_output = output[:, -1, :]
+        logits = self.fc(last_output)
+        return logits
+
+### --- DELETED: SeparationAutoencoder class was removed --- ###
+
+### --- MODIFIED: ContinualLearner is now simpler --- ###
 class ContinualLearner(nn.Module):
     def __init__(self, *, dim, depth, heads, mlp_dim, num_tasks, classes_per_task,
-                #  attn_tokens_per_task, ffn_tokens_per_task, 
-                 device='cpu', attention_bonus_max=0.0): # Add bonus here
+                 device='cpu', attention_bonus_max=0.0):
         super().__init__()
-        self.attention_bonus_max = attention_bonus_max # Store bonus value
-        # ... (the rest of __init__ is the same as the "fair" version) ...
+        self.attention_bonus_max = attention_bonus_max
         self.num_tasks = num_tasks
         self.classes_per_task = classes_per_task
         self.device = device
-        # self.attn_tokens_per_task = attn_tokens_per_task
-        # self.ffn_tokens_per_task = ffn_tokens_per_task
+
         backbone = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
         self.backbone = create_feature_extractor(backbone, return_nodes={'layer4': 'features'})
         dim_backbone = 512
         for param in self.backbone.parameters():
             param.requires_grad = False
-        # self.adapter = nn.Linear(dim_backbone, dim)
-        # self.projection_head = ProjectionHead(
-        #     input_dim=dim_backbone,
-        #     hidden_dim=dim_backbone,
-        #     output_dim=dim # Project to the Tokenformer's dimension
-        # )
-        self.separation_autoencoder = SeparationAutoencoder(
-            input_dim=dim_backbone,
-            hidden_dim=dim_backbone,
-            separated_dim=dim # The separated dimension matches Tokenformer's dimension
-        )
-
-        # self.adapter = PattentionLayer(dim_backbone, dim, num_param_tokens=dim, device=device)
+            
+        ### --- NEW: Simple linear adapter replaces the autoencoder --- ###
+        self.adapter = nn.Linear(dim_backbone, dim)
+        
         self.growing_transformer = TokenformerEncoder(
             dim=dim, depth=depth, heads=heads, dim_head=dim, mlp_dim=mlp_dim, device=device
         )
+        
+        self.task_router = TaskRouter(
+            input_dim=dim,
+            hidden_dim=dim * 2,
+            num_tasks=num_tasks
+        )
+        
         num_patches = 7 * 7
         self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
         self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
         self.mlp_heads = nn.ModuleList([
             nn.Linear(dim, classes_per_task) for _ in range(num_tasks)
-            # PattentionLayer(dim, classes_per_task, num_param_tokens=classes_per_task * 4, device=device) for _ in range(num_tasks)
         ])
 
-    def projection_head_params(self):
-        """Returns an iterator over the projection head's parameters."""
-        # return self.separation_autoencoder.parameters()
-        for name, param in self.separation_autoencoder.named_parameters():
-            if param.requires_grad:
-                yield param
-        
-    def continual_learning_params(self):
-        """
-        Returns an iterator over all trainable parameters EXCEPT the projection head.
-        This includes the adapter, the growing transformer, CLS/Pos tokens, and MLP heads.
-        """
-        for name, param in self.named_parameters():
-            if param.requires_grad and 'projection_head' not in name:
-                yield param
-        
-    def forward(self, img, task_id, training=True, current_attention_bonus=0.0, return_features=False):
+    ### --- DELETED: projection_head_params and continual_learning_params methods removed --- ###
+    # A single optimizer will now handle all trainable parameters.
+
+    def forward(self, img, task_id, training=True, current_attention_bonus=0.0):
         self.backbone.eval()
         feature_map = self.backbone(img)['features']
         patch_embeddings = rearrange(feature_map, 'b d h w -> b (h w) d')
-        # adapted_embeddings = self.adapter(patch_embeddings, attention_bonus=current_attention_bonus, training=training)
-        separated_features_sequence, reconstructed_features_sequence = self.separation_autoencoder(patch_embeddings)
-        project_feature_vect = torch.mean(separated_features_sequence, dim=1)
-        b, n, _ = separated_features_sequence.shape
+        
+        ### --- MODIFIED: Use the new linear adapter --- ###
+        adapted_embeddings = self.adapter(patch_embeddings)
+        
+        b, n, _ = adapted_embeddings.shape
         cls_tokens = repeat(self.cls_token, '1 1 d -> b 1 d', b=b)
-        tokens = torch.cat((cls_tokens, separated_features_sequence), dim=1)
+        tokens = torch.cat((cls_tokens, adapted_embeddings), dim=1)
         tokens += self.pos_embedding
         
-        # Pass the task_id AND bonus down to the encoder during training
         output_sequence = self.growing_transformer(tokens, task_id, current_attention_bonus, training=training)
         cls_output = output_sequence[:, 0]
         
-        # if return_features:
-        #     return self.mlp_heads[task_id](cls_output), project_feature_vect
-        
-        # if training == False or return_features:
-        #     outputs = []
-        #     for o in range(self.num_tasks):
-        #         out = self.mlp_heads[o](cls_output)
-        #         outputs.append(out)
-        #     outputs = torch.cat(outputs, dim=1)
-        #     return outputs, project_feature_vect
-
+        ### --- MODIFIED: Simplified return values --- ###
         if training:
-            return self.mlp_heads[task_id](cls_output), patch_embeddings, project_feature_vect, reconstructed_features_sequence
+            classification_logits = self.mlp_heads[task_id](cls_output)
+            router_logits = self.task_router(cls_output)
+            return classification_logits, router_logits
         else:
             outputs = []
             for o in range(self.num_tasks):
                 out = self.mlp_heads[o](cls_output)
                 outputs.append(out)
             outputs = torch.cat(outputs, dim=1)
-            return outputs
+            return outputs, cls_output
 
     def grow(self):
         print("\n--- Growing Model (Tokenformer Encoder) ---")
-        # NOTE: Growth factor is hardcoded for simplicity
-        # new_tokens_per_layer = 128 // 2 
-        # if isinstance(self.adapter, PattentionLayer):
-        #     if self.adapter.growth_indices == []:
-        #         new_tokens_per_layer = self.adapter.key_param_tokens.shape[0]
-        #     else:
-        #         new_tokens_per_layer = self.adapter.growth_indices[0]
-        #     self.adapter.grow(new_tokens_per_layer)
         for module in self.growing_transformer.modules():
             if isinstance(module, PattentionLayer):
-                if module.growth_indices == []:
+                if not module.growth_indices:
                     new_tokens_per_layer = module.key_param_tokens.shape[0]
                 else:
                     new_tokens_per_layer = module.growth_indices[0]
