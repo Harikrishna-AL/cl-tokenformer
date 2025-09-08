@@ -244,7 +244,130 @@ def apply_masks_and_hooks(model):
                 handles.append(module.value_param_specific.register_hook(lambda grad, m=module: apply_grad_mask_hook(grad, m.specific_grad_mask)))
     return handles
 
+# --- NEW: CONTINUAL LEARNING LOSS FUNCTIONS ---
+def self_distillation_loss_fn(model_current, model_old, data):
+    with torch.no_grad():
+        features_old = model_old.get_features(data)
+    features_current = model_current.get_features(data)
+    return F.mse_loss(features_current, features_old)
 
+def mahalanobis_distance_sq(x, y, inv_cov):
+    delta = x - y
+    return torch.einsum('bi,ij,bj->b', delta, inv_cov, delta)
+
+def covariance_calibration_loss_fn(model_current, model_old, data, stored_covariances, device):
+    loss = 0.0
+    num_classes = 0
+    with torch.no_grad():
+        features_old = model_old.get_features(data)
+    features_current = model_current.get_features(data)
+
+    for class_cov in stored_covariances.values():
+        inv_cov = torch.inverse(class_cov.to(device))
+        # Use pairs of samples to calculate distance
+        dist_old = mahalanobis_distance_sq(features_old[:-1], features_old[1:], inv_cov)
+        dist_current = mahalanobis_distance_sq(features_current[:-1], features_current[1:], inv_cov)
+        loss += F.l1_loss(dist_current, dist_old)
+        num_classes += 1
+        
+    return loss / num_classes if num_classes > 0 else 0.0
+
+# --- NEW: POST-TRAINING CALIBRATION & ALIGNMENT ---
+def update_statistics(model, data_loader, device):
+    """Calculates and returns the mean and covariance for the current task's data."""
+    model.eval()
+    all_features = []
+    with torch.no_grad():
+        for data, _ in data_loader:
+            data = data.to(device)
+            features = model.get_features(data)
+            all_features.append(features.cpu())
+    
+    all_features = torch.cat(all_features, dim=0)
+    mean = torch.mean(all_features, dim=0)
+    cov = torch.cov(all_features.T)
+    return mean, cov
+
+def mean_shift_compensation(model_current, model_old, data_loader, stored_means, device):
+    print("🔧 Calibrating means (Mean Shift Compensation)...")
+    model_current.eval()
+    model_old.eval()
+    
+    # Estimate shift using new task's data
+    all_shifts = []
+    with torch.no_grad():
+        for data, _ in data_loader:
+            data = data.to(device)
+            features_old = model_old.get_features(data)
+            features_current = model_current.get_features(data)
+            all_shifts.append((features_current - features_old).cpu())
+            
+    avg_shift = torch.mean(torch.cat(all_shifts, dim=0), dim=0)
+    
+    # Apply shift to all old class means
+    for task_id in stored_means:
+        stored_means[task_id] += avg_shift
+        
+    print("Mean calibration complete.")
+    return stored_means
+
+    def classifier_alignment(model, stored_means, stored_covariances, num_tasks_seen, classes_per_task, device, config):
+        print("🔧 Aligning classifier...")
+        model.train() # Set to train mode to update classifier weights
+        
+        # Isolate classifier parameters
+        classifier_params = []
+        for i in range(num_tasks_seen):
+            classifier_params.extend(model.mlp_heads[i].parameters())
+        
+        optimizer = torch.optim.Adam(classifier_params, lr=config["lr_align"])
+        criterion = nn.CrossEntropyLoss()
+        
+        for epoch in range(config["align_epochs"]):
+            # Generate synthetic features
+            features, labels = [], []
+            for class_id in range(num_tasks_seen * classes_per_task):
+                task_id = class_id // classes_per_task
+                mean = stored_means[task_id]
+                cov = stored_covariances[task_id]
+                dist = torch.distributions.MultivariateNormal(mean, covariance_matrix=cov)
+                
+                # Sample features and create labels
+                synth_features = dist.sample((config["align_batch_size"],))
+                synth_labels = torch.full((config["align_batch_size"],), fill_value=class_id, dtype=torch.long)
+                
+                features.append(synth_features)
+                labels.append(synth_labels)
+
+            features = torch.cat(features, dim=0).to(device)
+            labels = torch.cat(labels, dim=0).to(device)
+            
+            # Train the classifier head
+            optimizer.zero_grad()
+            # Pass synthetic features through the corresponding heads
+            outputs = []
+            for i in range(num_tasks_seen):
+                start_idx = i * classes_per_task * config["align_batch_size"]
+                end_idx = start_idx + classes_per_task * config["align_batch_size"]
+                if end_idx > start_idx:
+                    outputs.append(model.mlp_heads[i](features[start_idx:end_idx]))
+
+            output = torch.cat(outputs, dim=0)
+            
+            # Adjust labels to be task-local
+            local_labels = labels % classes_per_task
+            
+            loss = criterion(output, local_labels)
+            loss.backward()
+            optimizer.step()
+            
+            if epoch % 5 == 0:
+                print(f"  Classifier Alignment Epoch {epoch+1}/{config['align_epochs']}, Loss: {loss.item():.4f}")
+        
+        print("Classifier alignment complete.")
+
+
+# --- MAIN TRAINING SCRIPT ---
 if __name__ == '__main__':
     config = {
         "num_tasks": 5, "classes_per_task": 2, "batch_size": 128,
