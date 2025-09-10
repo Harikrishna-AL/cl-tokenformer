@@ -3,48 +3,12 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
-import torchvision.models as models
-from torchvision.models.feature_extraction import create_feature_extractor
 
 from einops import rearrange, repeat
 
-# PattentionLayer, TokenformerFeedForward, TokenformerAttention, TokenformerEncoder
-# are unchanged. They are the core building blocks.
-class SeparationAutoencoder(nn.Module):
-    """
-    An autoencoder that learns to create a separated feature representation.
-    - The encoder is the "separation layer".
-    - The decoder is used to enforce a reconstruction loss, ensuring the
-      encoded features remain informative.
-    """
-    def __init__(self, input_dim, hidden_dim, separated_dim):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, separated_dim)
-        )
-        self.decoder = nn.Sequential(
-            nn.Linear(separated_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, input_dim)
-        )
-
-    def forward(self, x):
-        separated_features = self.encoder(x)
-        reconstructed_features = self.decoder(separated_features)
-        return separated_features, reconstructed_features
-
-class ProjectionHead(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim)
-        )
-    def forward(self, x):
-        return self.net(x)
+# NOTE: PattentionLayer, TokenformerFeedForward, TokenformerAttention, 
+#       and TokenformerEncoder are unchanged, except for the parameter
+#       initialization in the PattentionLayer.grow() method.
 
 class PattentionLayer(nn.Module):
     def __init__(self, dim_in, dim_out, num_param_tokens, device='cpu'):
@@ -64,11 +28,9 @@ class PattentionLayer(nn.Module):
 
     def forward(self, x, task_id=-1, attention_bonus=0.0, training=True):
         if self.key_param_tokens.shape[0] == 0:
-            # ... (empty layer handling is the same) ...
             return torch.zeros(x.shape[:-1] + (self.value_param_tokens.shape[1],), device=self.device)
 
         similarity = torch.matmul(x, self.key_param_tokens.T) * self.scale
-        # ### NEW: Apply the Attention Bonus during Training ###
         if training and task_id > 0:
             bonus = torch.zeros_like(similarity)
             boundaries = [0] + self.growth_indices + [self.key_param_tokens.shape[0]]
@@ -76,40 +38,83 @@ class PattentionLayer(nn.Module):
             if task_id < len(boundaries) - 1:
                 start_idx = boundaries[task_id]
                 end_idx = boundaries[task_id + 1]
-                
-                # Add the bonus only to the similarity scores of the current task's params
-                if len(similarity.shape) == 3: # For sequence data (B, N, D)
+                if len(similarity.shape) == 3:
                     bonus[:, :, start_idx:end_idx] += attention_bonus
-                else: # For non-sequence data (B, D)
+                else:
                     bonus[:, start_idx:end_idx] += attention_bonus
-                
                 similarity = similarity + bonus
             
         norm_similarity = F.normalize(similarity, p=2, dim=-1)
         attn_weights = F.gelu(norm_similarity)
-        self.attn_weights = similarity
+        self.attn_weights = attn_weights
         out = torch.matmul(attn_weights, self.value_param_tokens)
         return out
 
     def grow(self, num_new_tokens):
-        # ... (grow method is unchanged) ...
         dim_in = self.key_param_tokens.shape[1]
         dim_out = self.value_param_tokens.shape[1]
         num_old_tokens = self.key_param_tokens.shape[0]
-        if num_old_tokens > 0:
-             self.growth_indices.append(num_old_tokens)
+
+        if num_old_tokens == 0:
+            # Handle the very first growth if the layer starts empty
+            new_key_tokens = torch.randn(num_new_tokens, dim_in, device=self.device)
+            new_value_tokens = torch.randn(num_new_tokens, dim_out, device=self.device)
+        else:
+            # if not self.growth_indices: self.growth_indices.append(0)
+            # --- NEW: Norm-Aligned Centroid Initialization ---
+            # 1. Identify the most recently trained parameters
+            if self.growth_indices:
+                last_task_start_idx = self.growth_indices[-1] 
+            else: 
+                last_task_start_idx = 0
+
+            old_keys_to_sample_from = self.key_param_tokens.data
+            old_values_to_sample_from = self.value_param_tokens.data
+            
+            num_old_to_sample = old_keys_to_sample_from.shape[0]
+
+            # 2. Randomly select indices from the old tokens (with replacement)
+            random_indices = torch.randint(0, num_old_to_sample, (num_new_tokens,), device=self.device)
+
+            # 3. Create the base for new tokens by sampling from the old ones
+            base_new_keys = old_keys_to_sample_from[random_indices]
+            base_new_values = old_values_to_sample_from[random_indices]
+
+            # 4. Add small random noise to break symmetry and encourage specialization
+            noise_k = torch.randn(num_new_tokens, dim_in, device=self.device) * 0.01
+            noise_v = torch.randn(num_new_tokens, dim_out, device=self.device) * 0.01
+            
+            new_key_tokens = base_new_keys + noise_k
+            new_value_tokens = base_new_values + noise_v
+
+            # 5. (Optional but recommended) Align the norm to maintain energy
+            avg_key_norm = torch.mean(torch.norm(old_keys_to_sample_from, p=2, dim=1))
+            avg_value_norm = torch.mean(torch.norm(old_values_to_sample_from, p=2, dim=1))
+            
+            new_key_tokens = F.normalize(new_key_tokens, p=2, dim=1) * avg_key_norm
+            new_value_tokens = F.normalize(new_value_tokens, p=2, dim=1) * avg_value_norm
+
+        # Freeze all existing parameters by updating the mask
         self.key_grad_mask.fill_(0)
         self.value_grad_mask.fill_(0)
-        new_key_tokens = torch.randn(num_new_tokens, dim_in, device=self.device) * 0.01
-        new_value_tokens = torch.randn(num_new_tokens, dim_out, device=self.device) * 0.01
-        new_key_mask = torch.ones_like(new_key_tokens)
-        new_value_mask = torch.ones_like(new_value_tokens)
+        
+        # Create masks for the new tokens (these will be trainable)
+        new_key_mask = torch.ones(num_new_tokens, dim_in, device=self.device)
+        new_value_mask = torch.ones(num_new_tokens, dim_out, device=self.device)
+
+        # print("old",self.key_param_tokens)
+        # print("new",new_key_tokens)
+        self.growth_indices.append(self.key_param_tokens.shape[0])
+        # Append new parameters and masks
         self.key_param_tokens = nn.Parameter(torch.cat([self.key_param_tokens.data, new_key_tokens], dim=0))
         self.value_param_tokens = nn.Parameter(torch.cat([self.value_param_tokens.data, new_value_tokens], dim=0))
         self.key_grad_mask = torch.cat([self.key_grad_mask, new_key_mask], dim=0)
         self.value_grad_mask = torch.cat([self.value_grad_mask, new_value_mask], dim=0)
+        
+        # Record the start index of the *next* group of tokens
+        
 
-### --- Modules updated to pass task_id --- ###
+
 class TokenformerFeedForward(nn.Module):
     def __init__(self, dim, hidden_dim, ffn_num_param_tokens, dropout = 0., device='cpu', training=True):
         super().__init__()
@@ -151,7 +156,6 @@ class TokenformerAttention(nn.Module):
         q = self.to_q(x_norm, task_id, attention_bonus, training)
         k = self.to_k(x_norm, task_id, attention_bonus,training)
         v = self.to_v(x_norm, task_id, attention_bonus, training)
-        # ... (rest of the forward pass is the same) ...
         if q.shape[1] == 0: return torch.zeros_like(x)
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), (q, k, v))
         dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
@@ -179,114 +183,71 @@ class TokenformerEncoder(nn.Module):
         return self.norm(x)
 
 class ContinualLearner(nn.Module):
-    def __init__(self, *, dim, depth, heads, mlp_dim, num_tasks, classes_per_task,
-                #  attn_tokens_per_task, ffn_tokens_per_task, 
-                 device='cpu', attention_bonus_max=0.0): # Add bonus here
+    def __init__(self, *, image_size, dim, depth, heads, mlp_dim, num_tasks, classes_per_task,
+                 channels=1, device='cpu', attention_bonus_max=0.0):
         super().__init__()
-        self.attention_bonus_max = attention_bonus_max # Store bonus value
-        # ... (the rest of __init__ is the same as the "fair" version) ...
+        self.attention_bonus_max = attention_bonus_max
         self.num_tasks = num_tasks
         self.classes_per_task = classes_per_task
         self.device = device
-        # self.attn_tokens_per_task = attn_tokens_per_task
-        # self.ffn_tokens_per_task = ffn_tokens_per_task
-        backbone = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        self.backbone = create_feature_extractor(backbone, return_nodes={'layer4': 'features'})
-        dim_backbone = 512
-        for param in self.backbone.parameters():
-            param.requires_grad = False
-        # self.adapter = nn.Linear(dim_backbone, dim)
-        # self.projection_head = ProjectionHead(
-        #     input_dim=dim_backbone,
-        #     hidden_dim=dim_backbone,
-        #     output_dim=dim # Project to the Tokenformer's dimension
-        # )
-        self.separation_autoencoder = SeparationAutoencoder(
-            input_dim=dim_backbone,
-            hidden_dim=dim_backbone,
-            separated_dim=dim # The separated dimension matches Tokenformer's dimension
-        )
+        
+        # Input dimension from flattened image
+        input_dim = channels * image_size * image_size # e.g., 1 * 28 * 28 = 784 for MNIST
 
-        # self.adapter = PattentionLayer(dim_backbone, dim, num_param_tokens=dim, device=device)
+        # Projects the flattened image vector into the transformer's dimension
+        self.input_projection = nn.Linear(input_dim, dim)
+
         self.growing_transformer = TokenformerEncoder(
             dim=dim, depth=depth, heads=heads, dim_head=dim, mlp_dim=mlp_dim, device=device
         )
-        num_patches = 7 * 7
-        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
-        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
+        
+        # No [CLS] token or positional embedding needed for a single-token sequence
+        
         self.mlp_heads = nn.ModuleList([
             nn.Linear(dim, classes_per_task) for _ in range(num_tasks)
-            # PattentionLayer(dim, classes_per_task, num_param_tokens=classes_per_task * 4, device=device) for _ in range(num_tasks)
         ])
+        
+    def forward(self, img, task_id, training=True, current_attention_bonus=0.0):
+        # 1. Flatten and project the input image to a single token
+        img_flat = rearrange(img, 'b c h w -> b (c h w)')
+        tokens = self.input_projection(img_flat).unsqueeze(1) # Shape: (b, 1, dim)
 
-    def projection_head_params(self):
-        """Returns an iterator over the projection head's parameters."""
-        # return self.separation_autoencoder.parameters()
-        for name, param in self.separation_autoencoder.named_parameters():
-            if param.requires_grad:
-                yield param
-        
-    def continual_learning_params(self):
-        """
-        Returns an iterator over all trainable parameters EXCEPT the projection head.
-        This includes the adapter, the growing transformer, CLS/Pos tokens, and MLP heads.
-        """
-        for name, param in self.named_parameters():
-            if param.requires_grad and 'projection_head' not in name:
-                yield param
-        
-    def forward(self, img, task_id, training=True, current_attention_bonus=0.0, return_features=False):
-        self.backbone.eval()
-        feature_map = self.backbone(img)['features']
-        patch_embeddings = rearrange(feature_map, 'b d h w -> b (h w) d')
-        # adapted_embeddings = self.adapter(patch_embeddings, attention_bonus=current_attention_bonus, training=training)
-        separated_features_sequence, reconstructed_features_sequence = self.separation_autoencoder(patch_embeddings)
-        project_feature_vect = torch.mean(separated_features_sequence, dim=1)
-        b, n, _ = separated_features_sequence.shape
-        cls_tokens = repeat(self.cls_token, '1 1 d -> b 1 d', b=b)
-        tokens = torch.cat((cls_tokens, separated_features_sequence), dim=1)
-        tokens += self.pos_embedding
-        
-        # Pass the task_id AND bonus down to the encoder during training
+        # No [CLS] token or pos_embedding to add. The sequence length is 1.
+
+        # 2. Pass the single-token sequence through the Tokenformer encoder
         output_sequence = self.growing_transformer(tokens, task_id, current_attention_bonus, training=training)
-        cls_output = output_sequence[:, 0]
         
-        # if return_features:
-        #     return self.mlp_heads[task_id](cls_output), project_feature_vect
-        
-        # if training == False or return_features:
-        #     outputs = []
-        #     for o in range(self.num_tasks):
-        #         out = self.mlp_heads[o](cls_output)
-        #         outputs.append(out)
-        #     outputs = torch.cat(outputs, dim=1)
-        #     return outputs, project_feature_vect
+        # 3. Get the output token (it's the only one in the sequence) for classification
+        output_token = output_sequence[:, 0] # Shape: (b, dim)
 
+        # 4. Route to the appropriate head
         if training:
-            return self.mlp_heads[task_id](cls_output), patch_embeddings, project_feature_vect, reconstructed_features_sequence
+            # During training, we only need the output for the current task
+            return self.mlp_heads[task_id](output_token)
         else:
+            # --- MODIFIED: During evaluation, use the head for the given task_id ---
+            # This is for a "task-aware" evaluation setting.
             outputs = []
-            for o in range(self.num_tasks):
-                out = self.mlp_heads[o](cls_output)
+            for t in range(self.num_tasks):
+                out = self.mlp_heads[t](output_token)
                 outputs.append(out)
             outputs = torch.cat(outputs, dim=1)
+            # outputs = self.mlp_heads[task_id](output_token)
             return outputs
+            # --- END MODIFICATION ---
 
     def grow(self):
         print("\n--- Growing Model (Tokenformer Encoder) ---")
-        # NOTE: Growth factor is hardcoded for simplicity
-        # new_tokens_per_layer = 128 // 2 
-        # if isinstance(self.adapter, PattentionLayer):
-        #     if self.adapter.growth_indices == []:
-        #         new_tokens_per_layer = self.adapter.key_param_tokens.shape[0]
-        #     else:
-        #         new_tokens_per_layer = self.adapter.growth_indices[0]
-        #     self.adapter.grow(new_tokens_per_layer)
+        # Growth logic remains the same, growing parameters within PattentionLayers
         for module in self.growing_transformer.modules():
             if isinstance(module, PattentionLayer):
-                if module.growth_indices == []:
-                    new_tokens_per_layer = module.key_param_tokens.shape[0]
+                if not module.growth_indices:
+                    # For the first growth, grow by the initial number of tokens
+                    # new_tokens_per_layer = module.key_param_tokens.shape[0]
+                    new_tokens_per_layer = 32
                 else:
-                    new_tokens_per_layer = module.growth_indices[0]
+                    # For subsequent growths, grow by the size of the first task's parameters
+                    # new_tokens_per_layer = module.growth_indices[0]
+                    new_tokens_per_layer = 32
                 module.grow(new_tokens_per_layer)
         print("--- Model Growth Complete ---")

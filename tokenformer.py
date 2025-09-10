@@ -1,15 +1,15 @@
 # tokenformer_inference.py
 import torch
 import torch.nn as nn
-from vit_pytorch import ContinualLearner, PattentionLayer
+from vit_pytorch import ContinualLearner, PattentionLayer # Import from the local file
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset, TensorDataset, Dataset
+from torch.utils.data import DataLoader, Subset
 from torchvision.datasets import MNIST
 from torchvision import transforms
 from tqdm import tqdm
 import numpy as np
 import os
-import argparse # ### NEW: For command-line arguments ###
+import argparse
 
 # Try to import wandb
 try:
@@ -19,8 +19,7 @@ except ImportError:
     WANDB_AVAILABLE = False
     print("wandb not installed. Skipping W&B logging. To install: pip install wandb")
 
-### --- NEW: CHECKPOINTING FUNCTIONS --- ###
-
+### --- CHECKPOINTING FUNCTIONS (Unchanged) --- ###
 def save_checkpoint(state, filename="checkpoint.pth.tar"):
     print("=> Saving checkpoint")
     torch.save(state, filename)
@@ -42,111 +41,45 @@ def load_checkpoint(model, filename="checkpoint.pth.tar"):
         model.load_state_dict(checkpoint['model_state_dict'])
         
         print(f"=> Loaded checkpoint! Resuming from Task {start_task_idx}")
-        # Optimizers will be re-created and loaded in the main script
-        return model, start_task_idx, global_step, results_history, checkpoint.get('optimizers_state_dict')
+        return model, start_task_idx, global_step, results_history, checkpoint.get('optimizer_state_dict')
     else:
         print(f"=> No checkpoint found at '{filename}'")
         return model, 0, 0, {}, None
 
-### --- NEW: RESULTS TABLE FUNCTION --- ###
-
+### --- RESULTS TABLE FUNCTION (Unchanged) --- ###
 def print_results_table(history, num_tasks):
-    """Prints a formatted table of average accuracies."""
     print("\n\n--- Final Results Summary ---")
-    
-    # Header
     header = f"{'After Training Task':<25}"
     for i in range(num_tasks):
         header += f"  Task {i} Acc (%) "
     header += "  Average Acc (%)"
     print(header)
     print("-" * len(header))
-
-    # Rows
     for trained_task_id, accs in history.items():
         row = f"{f'Task {trained_task_id}':<25}"
-        
-        # Print accuracies for tasks seen so far
         for i in range(len(accs)):
             row += f"    {accs[i]:<10.2f}"
-        
-        # Fill in the rest with dashes
         for i in range(num_tasks - len(accs)):
             row += f"    {'--':<10}"
-            
         avg_acc = np.mean(accs)
         row += f"    {avg_acc:<10.2f}"
         print(row)
     print("-" * len(header))
 
-
-# ... (count_parameters, get_split_mnist_loaders, evaluate, apply_masks_and_hooks, calculate_orthogonality_loss are unchanged) ...
-# ... (train_until_plateau is also unchanged from the last corrected version) ...
 def count_parameters(model, trainable_only=False):
     if trainable_only:
         return sum(p.numel() for p in model.parameters() if p.requires_grad)
     return sum(p.numel() for p in model.parameters())
 
-def preprocess_mnist_to_disk(root='./data'):
-    """
-    Transforms and saves each MNIST image as a separate file.
-    This is a one-time, memory-safe operation.
-    """
-    preprocessed_dir = os.path.join(root, "mnist_preprocessed")
-    if os.path.exists(preprocessed_dir):
-        print(f"✔️ Preprocessed data found at {preprocessed_dir}")
-        return
-
-    print(f"⚠️ No preprocessed data found. Creating cache at {preprocessed_dir}...")
-    os.makedirs(preprocessed_dir, exist_ok=True)
-
-    transform = transforms.Compose([
-        transforms.Resize(224),
-        transforms.Grayscale(num_output_channels=3),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-
-    for split in ['train', 'test']:
-        is_train = (split == 'train')
-        raw_dataset = MNIST(root=root, train=is_train, download=True)
-        split_dir = os.path.join(preprocessed_dir, split)
-        os.makedirs(split_dir, exist_ok=True)
-        
-        for i, (img, label) in enumerate(tqdm(raw_dataset, desc=f"Preprocessing {split} set")):
-            transformed_img = transform(img)
-            save_path = os.path.join(split_dir, f"sample_{i}.pt")
-            torch.save((transformed_img, label), save_path)
-
-class PreprocessedMNIST(Dataset):
-    """
-    A custom Dataset class that loads pre-transformed tensors from disk.
-    Initialization is fast as it only scans for file paths.
-    """
-    def __init__(self, root='./data', train=True):
-        split = 'train' if train else 'test'
-        self.data_dir = os.path.join(root, "mnist_preprocessed", split)
-        self.samples = [os.path.join(self.data_dir, f) for f in os.listdir(self.data_dir) if f.endswith('.pt')]
-        
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, index):
-        # Load one pre-transformed sample from disk
-        return torch.load(self.samples[index])
-
 def get_split_mnist_loaders(num_tasks, classes_per_task, batch_size):
-    """ Prepares Split MNIST dataloaders using the on-disk cache. """
-    # Ensure the on-disk cache exists, creating it if necessary
-    preprocess_mnist_to_disk()
-
-    # Load the custom datasets which point to the preprocessed files
-    full_train_dataset = PreprocessedMNIST(train=True)
-    full_test_dataset = PreprocessedMNIST(train=False)
-
-    # Get the original labels for splitting
-    raw_mnist_train = MNIST(root='./data', train=True, download=True)
-    raw_mnist_test = MNIST(root='./data', train=False, download=True)
+    """ Prepares Split MNIST dataloaders using standard torchvision."""
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,)) # Standard MNIST stats
+    ])
+    
+    full_train_dataset = MNIST(root='./data', train=True, download=True, transform=transform)
+    full_test_dataset = MNIST(root='./data', train=False, download=True, transform=transform)
 
     train_loaders, test_loaders = [], []
     for task_id in range(num_tasks):
@@ -154,9 +87,8 @@ def get_split_mnist_loaders(num_tasks, classes_per_task, batch_size):
         end_class = (task_id + 1) * classes_per_task
         task_classes = list(range(start_class, end_class))
         
-        # Find indices for the current task (this is fast)
-        train_indices = [i for i, label in enumerate(raw_mnist_train.targets) if label in task_classes]
-        test_indices = [i for i, label in enumerate(raw_mnist_test.targets) if label in task_classes]
+        train_indices = [i for i, label in enumerate(full_train_dataset.targets) if label in task_classes]
+        test_indices = [i for i, label in enumerate(full_test_dataset.targets) if label in task_classes]
 
         train_subset = Subset(full_train_dataset, train_indices)
         test_subset = Subset(full_test_dataset, test_indices)
@@ -167,62 +99,18 @@ def get_split_mnist_loaders(num_tasks, classes_per_task, batch_size):
         
     return train_loaders, test_loaders
 
-# class CuratedRehearsalBuffer:
-#     """
-#     A buffer that stores a few of the hardest samples per task.
-#     "Hardest" is defined as the samples with the highest loss.
-#     """
-#     def __init__(self, samples_per_task=5):
-#         self.samples_per_task = samples_per_task
-#         # Buffer is now a dictionary mapping task_id to a list of feature vectors
-#         self.buffer = {}
-
-#     def add_task_samples(self, task_id, features, losses):
-#         """Finds the k hardest samples and adds them to the buffer for the given task."""
-#         if features is None or losses is None:
-#             return
-            
-#         # Get the indices of the samples with the highest loss
-#         _, top_k_indices = torch.topk(losses, k=min(self.samples_per_task, len(losses)))
-        
-#         hardest_samples = features[top_k_indices].detach().cpu()
-#         self.buffer[task_id] = hardest_samples
-#         print(f"✅ Stored {len(hardest_samples)} hardest samples for Task {task_id} in the buffer.")
-
-#     def sample(self, batch_size):
-#         """Samples a balanced batch from all past tasks in the buffer."""
-#         if not self.buffer:
-#             return None
-        
-#         all_past_samples = torch.cat(list(self.buffer.values()), dim=0)
-        
-#         if len(all_past_samples) == 0:
-#             return None
-
-#         indices = np.random.choice(len(all_past_samples), size=min(batch_size, len(all_past_samples)), replace=False)
-#         return all_past_samples[indices]
-
-def separation_loss_fn(current_features, past_features):
-    """Pushes current features away from past features by minimizing cosine similarity."""
-    current_features = F.normalize(current_features, p=2, dim=1)
-    past_features = F.normalize(past_features, p=2, dim=1)
-    # The mean similarity is returned, which the optimizer will minimize (pushing it to -1)
-    # To make it more explicit to push towards orthogonality (similarity=0), we can use squared similarity.
-    return torch.mean(torch.matmul(current_features, past_features.T)**2)
-
 def evaluate(model, test_loaders, device, num_tasks_seen, classes_per_task):
-    """ Task-free evaluation for the new single-output model. """
+    """ Evaluates the model on all tasks seen so far. """
     model.eval()
     accuracies = []
     with torch.no_grad():
         for task_id in range(num_tasks_seen):
             correct, total = 0, 0
-            start_class = task_id * classes_per_task
             for data, target in test_loaders[task_id]:
                 data, target = data.to(device), target.to(device)
-                target = target - start_class
-                # Call model in task-free inference mode
-                # output = model(data, task_id=None, num_tasks_seen=num_tasks_seen)
+                # target = target % 2
+                
+                # The model's eval mode produces a single output tensor with scores for all classes
                 output = model(data, task_id=task_id, training=False)
                 
                 # Get the predicted GLOBAL class index
@@ -254,53 +142,6 @@ def apply_masks_and_hooks(model, current_task_id, previous_handles):
             ))
     return new_handles
 
-class CuratedRehearsalBuffer:
-    def __init__(self, samples_per_task=10):
-        self.samples_per_task = samples_per_task
-        self.buffer = {} # Maps task_id to a tuple of (resnet_features, separated_features, labels)
-
-    def add_task_samples(self, task_id, resnet_features, separated_features, losses, labels):
-        if resnet_features is None or separated_features is None or losses is None or labels is None:
-            return
-        _, top_k_indices = torch.topk(losses, k=min(self.samples_per_task, len(losses)))
-        
-        self.buffer[task_id] = (
-            resnet_features[top_k_indices].detach().cpu(),
-            separated_features[top_k_indices].detach().cpu(),
-            labels[top_k_indices].detach().cpu()
-        )
-        print(f"✅ Stored {len(top_k_indices)} hardest samples for Task {task_id} in the buffer.")
-
-    def sample(self, batch_size, exclude_task_id=None):
-        """
-        Samples a batch from the buffer.
-        If exclude_task_id is provided, it samples from all tasks EXCEPT that one.
-        """
-        if not self.buffer:
-            return None, None, None
-        
-        # --- EDITED LOGIC ---
-        # Collect features and labels from relevant tasks
-        tasks_to_sample_from = []
-        for task_id, data in self.buffer.items():
-            if exclude_task_id is None or task_id != exclude_task_id:
-                tasks_to_sample_from.append(data)
-
-        if not tasks_to_sample_from:
-            return None, None, None
-
-        # Concatenate data from the selected tasks
-        all_resnet_feats = torch.cat([item[0] for item in tasks_to_sample_from], dim=0)
-        all_separated_feats = torch.cat([item[1] for item in tasks_to_sample_from], dim=0)
-        all_labels = torch.cat([item[2] for item in tasks_to_sample_from], dim=0)
-        # --- END EDITED LOGIC ---
-        
-        if len(all_resnet_feats) == 0:
-            return None, None, None
-
-        indices = np.random.choice(len(all_resnet_feats), size=min(batch_size, len(all_resnet_feats)), replace=False)
-        return all_resnet_feats[indices], all_separated_feats[indices], all_labels[indices]
-
 def calculate_orthogonality_loss(growing_module):
     ortho_loss = 0.0
     num_layers = 0
@@ -309,7 +150,6 @@ def calculate_orthogonality_loss(growing_module):
             last_growth_idx = module.growth_indices[-1]
             k_old = module.key_param_tokens[:last_growth_idx]
             k_new = module.key_param_tokens[last_growth_idx:]
-
             v_old = module.value_param_tokens[:last_growth_idx]
             v_new = module.value_param_tokens[last_growth_idx:]
 
@@ -324,24 +164,21 @@ def calculate_orthogonality_loss(growing_module):
                 num_layers += 1
     return ortho_loss / num_layers if num_layers > 0 else 0.0
 
-def train_until_plateau(model, current_task_id, train_loader, optimizer_main, optimizer_proj, criterion, rehearsal_buffer, device,
+def train_until_plateau(model, current_task_id, train_loader, optimizer, criterion, device,
                         classes_per_task, global_step, config):
     model.train()
     hook_handles = apply_masks_and_hooks(model, current_task_id, [])
+    
     patience = config["patience"]
     min_delta = config["min_delta_loss"]
     lambda_max = config["lambda_max"]
     lambda_min = config["lambda_min"]
     bonus_max = config["attention_bonus_max"]
     lambda_decay_epochs = config["lambda_decay_epochs"]
+    
     patience_counter = 0
     best_loss = float('inf')
     epoch = 0
-    last_epoch_features = []
-    last_epoch_losses = []
-    last_epoch_resnet_features = []
-    last_epoch_labels = []
-    recon_criterion = nn.MSELoss()
 
     print(f"🚀 Starting training for model task {current_task_id} (patience={patience}, lambda: {lambda_max} -> {lambda_min}).")
     while patience_counter < patience:
@@ -349,53 +186,33 @@ def train_until_plateau(model, current_task_id, train_loader, optimizer_main, op
         epoch_loss = 0.0
         num_batches = 0
         decay_factor = max(0, (1 - epoch / lambda_decay_epochs))
-        # current_lambda = lambda_min + (lambda_max - lambda_min) * decay_factor
         current_attention_bonus = bonus_max * decay_factor
         current_lambda = lambda_max
 
-        if patience_counter == 1: 
-             last_epoch_features.clear()
-             last_epoch_losses.clear()
-
-        
         for batch_idx, (data, target) in enumerate(loop):
-
             data, target = data.to(device), target.to(device)
+            # Make targets relative to the current task (e.g., classes {2, 3} -> {0, 1})
             target = target - current_task_id * classes_per_task
-            # optimizer.zero_grad()
-            # optimizer.zero_grad(set_to_none=True)
-            optimizer_main.zero_grad(set_to_none=True)
-            optimizer_proj.zero_grad(set_to_none=True)
             
-            output, resnet_feats, sep_feats, recon_feats = model(data, current_task_id, current_attention_bonus=current_attention_bonus, return_features=True)
+            optimizer.zero_grad(set_to_none=True)
+            
+            # Model returns logits for the current task head
+            output = model(data, current_task_id, current_attention_bonus=current_attention_bonus, training=True)
             task_loss = criterion(output, target)
 
             ortho_loss = 0.0
-            if current_task_id > 0:
-                ortho_loss = calculate_orthogonality_loss(model.growing_transformer)
-
-            rec_loss = 0.0
-            rec_loss = recon_criterion(recon_feats, resnet_feats)
-
-            sep_loss = 0.0
-            _, past_features, _ = rehearsal_buffer.sample(data.size(0))
-            if past_features is not None:
-                past_features = past_features.to(device)
-                sep_loss += separation_loss_fn(sep_feats, past_features)
-            sep_loss += config["lambda_recon"]*rec_loss
-
-            total_loss = task_loss + current_lambda * ortho_loss 
-            total_loss.backward(retain_graph=True)
-
-            if isinstance(sep_loss, torch.Tensor):
-                sep_loss.backward()
-
-            optimizer_main.step()
-            optimizer_proj.step()
+            # if current_task_id > 0:
+            #     ortho_loss = calculate_orthogonality_loss(model.growing_transformer)
+            
+            # total_loss = task_loss + current_lambda * ortho_loss
+            total_loss = task_loss
+            total_loss.backward()
+            optimizer.step()
 
             epoch_loss += total_loss.item()
             num_batches += 1
             global_step += 1
+            
             if WANDB_AVAILABLE:
                 log_data = {
                     "task_loss": task_loss.item(), "total_loss": total_loss.item(),
@@ -404,21 +221,14 @@ def train_until_plateau(model, current_task_id, train_loader, optimizer_main, op
                 }
                 if current_task_id > 0:
                     log_data["ortho_loss"] = ortho_loss.item() if isinstance(ortho_loss, torch.Tensor) else ortho_loss
-                    log_data["sep_loss"] = sep_loss.item() if isinstance(sep_loss, torch.Tensor) else sep_loss
                 wandb.log(log_data)
+                
             loop.set_description(f"Data Task {config['data_task_idx']} | Model Task {current_task_id} | Epoch {epoch+1}")
-            loop.set_postfix(loss=total_loss.item(), ortho=f"{ortho_loss.item() if isinstance(ortho_loss, torch.Tensor) else 0:.4f}", lambda_o=f"{current_lambda:.4f}", sep_loss=f"{sep_loss.item() if isinstance(sep_loss, torch.Tensor) else 0:4f}", rec=rec_loss.item())
-
-            if patience_counter == 1:
-                last_epoch_features.append(sep_feats.detach().cpu())
-                last_epoch_resnet_features.append(resnet_feats.detach().cpu())
-                last_epoch_labels.append(target.cpu())
-                # We need per-sample loss, so we compute it here again without reduction
-                per_sample_loss = nn.CrossEntropyLoss(reduction='none')(output, target).detach().cpu()
-                last_epoch_losses.append(per_sample_loss)
+            loop.set_postfix(loss=total_loss.item(), ortho=f"{ortho_loss.item() if isinstance(ortho_loss, torch.Tensor) else 0:.4f}")
 
         avg_epoch_loss = epoch_loss / num_batches if num_batches > 0 else float('inf')
         print(f"\nEpoch {epoch+1} ended. Avg Total Loss: {avg_epoch_loss:.4f}. Best Loss: {best_loss:.4f}")
+        
         if avg_epoch_loss < best_loss - min_delta:
             best_loss = avg_epoch_loss
             patience_counter = 0
@@ -426,55 +236,18 @@ def train_until_plateau(model, current_task_id, train_loader, optimizer_main, op
         else:
             patience_counter += 1
             print(f"⚠️ Loss did not improve. Patience: {patience_counter}/{patience}")
+            
         epoch += 1
         if patience_counter >= patience:
             break
+            
     print(f"🏁 Loss plateaued after {epoch} epochs.")
-
-    final_features = torch.cat(last_epoch_features) if last_epoch_features else None
-    final_losses = torch.cat(last_epoch_losses) if last_epoch_losses else None
-    final_resnet_features = torch.cat(last_epoch_resnet_features) if last_epoch_resnet_features else None
-    final_labels = torch.cat(last_epoch_labels) if last_epoch_labels else None
-
     for handle in hook_handles:
         handle.remove()
-    return optimizer_main, optimizer_proj, global_step, final_features, final_losses, final_resnet_features, final_labels
-
-
-def sleep_phase_consolidation(model, optimizer_sep_ae, rehearsal_buffer, device, config, task_id):
-    print(f"😴 SLEEP PHASE: Consolidating Separation Layer knowledge...")
-    if not rehearsal_buffer.buffer:
-        print("Buffer is empty, skipping sleep phase."); return
-
-    model.separation_autoencoder.train()
-    recon_criterion = nn.MSELoss()
-    for epoch in range(config["sleep_epochs"]):
-        resnet_feats, separated_feats, _ = rehearsal_buffer.sample(config["buffer_size"], exclude_task_id=task_id)
-        if resnet_feats is None: continue
-        
-        buffer_dataset = TensorDataset(resnet_feats, separated_feats)
-        buffer_loader = DataLoader(buffer_dataset, batch_size=config["batch_size"], shuffle=True)
-        
-        loop = tqdm(buffer_loader, leave=False, desc=f"SLEEP Epoch {epoch+1}/{config['sleep_epochs']}")
-    
-        for resnet_f, separated_f_target in loop:
-            resnet_f, separated_f_target = resnet_f.to(device), separated_f_target.to(device)
-            optimizer_sep_ae.zero_grad()
-
-            separated_f_output, recon_f = model.separation_autoencoder(resnet_f)
-            
-            recon_loss = recon_criterion(recon_f, resnet_f)
-            ortho_loss = separation_loss_fn(separated_f_output, separated_f_target)
-            
-            total_loss = config["lambda_recon"] * recon_loss + config["lambda_sep"] * ortho_loss
-            total_loss.backward()
-            optimizer_sep_ae.step()
-            loop.set_postfix(loss=total_loss.item(), rec=recon_loss.item(), ort=ortho_loss.item())
-    
+    return optimizer, global_step
 
 if __name__ == '__main__':
-    # ### NEW: Argument Parser for resuming ###
-    parser = argparse.ArgumentParser(description='Tokenformer Continual Learning')
+    parser = argparse.ArgumentParser(description='Tokenformer Continual Learning on MNIST')
     parser.add_argument('--resume', default='', type=str, metavar='PATH',
                         help='path to latest checkpoint (default: none)')
     args = parser.parse_args()
@@ -482,58 +255,51 @@ if __name__ == '__main__':
     config = {
         "num_tasks": 5,
         "classes_per_task": 2,
-        "batch_size": 32,
+        "batch_size": 64,
         "patience": 2,
         "min_delta_loss": 0.01,
         "lr": 1e-4,
         "lambda_max": 10.0,
         "lambda_min": 0.01,
         "lambda_decay_epochs": 4,
-        # "attention_bonus": 1.0,
-        "attention_bonus_max": 0,
+        "attention_bonus_max": 0.0,
         "data_task_idx": 0,
-        "lambda_sep": 10.0, 
-        "buffer_size": 500,
-        "samples_per_task": 10,
-        "lambda_recon" : 1.0,
-        "sleep_epochs": 3,
     }
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
     if WANDB_AVAILABLE:
-        wandb.init(project="tokenformer-resnet-cl", config=config)
+        wandb.init(project="tokenformer-mnist-cl-simplified", config=config)
 
     model = ContinualLearner(
-        dim=128, depth=2, heads=4, mlp_dim=256,
-        num_tasks=config["num_tasks"], classes_per_task=config["classes_per_task"],
+        image_size=28,
+        dim=128, 
+        depth=2, 
+        heads=4, 
+        mlp_dim=256,
+        num_tasks=config["num_tasks"], 
+        classes_per_task=config["classes_per_task"],
         device=DEVICE,
         attention_bonus_max=config["attention_bonus_max"],
     ).to(DEVICE)
     
     train_loaders, test_loaders = get_split_mnist_loaders(config["num_tasks"], config["classes_per_task"], config["batch_size"])
     criterion = nn.CrossEntropyLoss()
-    # optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=config["lr"])
-    optimizer_main = torch.optim.Adam(model.continual_learning_params(), lr=config["lr"])
-    optimizer_proj = torch.optim.Adam(model.projection_head_params(), lr=config["lr"])
-    rehearsal_buffer = CuratedRehearsalBuffer(samples_per_task=config["samples_per_task"])
-
-    # ### NEW: Initialize state variables and load checkpoint if provided ###
+    optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=config["lr"])
+    
     start_task_idx = 0
     global_step = 0
     current_task_id = 0
     results_history = {}
 
     if args.resume:
-        model, start_task_idx, global_step, results_history, optimizers_state_dict = load_checkpoint(model, args.resume)
-        if optimizers_state_dict:
-            optimizer_main.load_state_dict(optimizers_state_dict['main'])
-            optimizer_proj.load_state_dict(optimizers_state_dict['proj'])
+        model, start_task_idx, global_step, results_history, optimizer_state_dict = load_checkpoint(model, args.resume)
+        if optimizer_state_dict:
+            optimizer.load_state_dict(optimizer_state_dict)
         current_task_id = start_task_idx - 1 if start_task_idx > 0 else 0
     
     print(f"Total model parameters: {count_parameters(model):,}")
     print(f"Trainable parameters: {count_parameters(model, trainable_only=True):,}")
 
-    # ### MODIFIED: Main loop starts from the correct task index ###
     for data_task_idx in range(start_task_idx, config["num_tasks"]):
         print(f"\n--- Presenting Data from Task {data_task_idx} (Model is on Task {current_task_id}) ---")
         config["data_task_idx"] = data_task_idx
@@ -542,45 +308,35 @@ if __name__ == '__main__':
              current_task_id += 1
              model.grow()
              print(f"Trainable parameters after growth: {count_parameters(model, trainable_only=True):,}")
-            #  optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=config["lr"])
-             optimizer_main = torch.optim.Adam(model.continual_learning_params(), lr=config["lr"])
-             optimizer_proj = torch.optim.Adam(model.projection_head_params(), lr=config["lr"])
+             # Re-initialize optimizer to include new parameters from growth
+             optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=config["lr"])
              if WANDB_AVAILABLE:
                  wandb.log({"growth_event": 1, "model_task_id": current_task_id, "global_step": global_step, "trainable_parameters": count_parameters(model, trainable_only=True)})
         
-        optimizer_main, optimizer_proj, global_step, final_features, final_losses, final_resnet_features, final_labels = train_until_plateau(
-            model, current_task_id, train_loaders[data_task_idx], optimizer_main, optimizer_proj, criterion, rehearsal_buffer, DEVICE, 
+        optimizer, global_step = train_until_plateau(
+            model, current_task_id, train_loaders[data_task_idx], optimizer, criterion, DEVICE, 
             config["classes_per_task"], global_step, config
         )
         
-        rehearsal_buffer.add_task_samples(current_task_id, final_resnet_features, final_features, final_losses, final_labels)
-
-        if data_task_idx > 0:
-            sleep_phase_consolidation(
-                model, optimizer_proj, rehearsal_buffer, DEVICE, config, data_task_idx)
-
         print(f"--- Finished Training on Data Task {data_task_idx} ---")
         accuracies = evaluate(model, test_loaders, DEVICE, current_task_id + 1, config["classes_per_task"])
         
-        # ### NEW: Store results and save checkpoint ###
         results_history[current_task_id] = accuracies
         
         state_to_save = {
             'current_task_id': current_task_id,
             'global_step': global_step,
             'model_state_dict': model.state_dict(),
-            'optimizers_state_dict': {
-                'main': optimizer_main.state_dict(),
-                'proj': optimizer_proj.state_dict(),
-            },
+            'optimizer_state_dict': optimizer.state_dict(),
             'results_history': results_history,
         }
         save_checkpoint(state_to_save, filename=f"checkpoint_task_{current_task_id}_final.pth.tar")
 
-    # ### NEW: Print final results table ###
     print_results_table(results_history, config["num_tasks"])
 
     if WANDB_AVAILABLE:
-        wandb.summary["final_average_accuracy"] = np.mean(results_history.get(config["num_tasks"] - 1, [0]))
+        final_accs = results_history.get(config["num_tasks"] - 1, [0])
+        if final_accs:
+            wandb.summary["final_average_accuracy"] = np.mean(final_accs)
         wandb.summary["final_trainable_parameters"] = count_parameters(model, trainable_only=True)
         wandb.finish()
