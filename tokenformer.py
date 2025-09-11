@@ -265,8 +265,9 @@ if __name__ == '__main__':
         "attention_bonus_max": 0.0,
         "data_task_idx": 0,
     }
-    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
+    # DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
+    print("DEVICE:", DEVICE)
     if WANDB_AVAILABLE:
         wandb.init(project="tokenformer-mnist-cl-simplified", config=config)
 
