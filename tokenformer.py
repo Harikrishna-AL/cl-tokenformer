@@ -1,9 +1,9 @@
-# tokenformer_inference.py
+# main_ipca.py
+
 import torch
 import torch.nn as nn
-from vit_pytorch import ContinualLearner, PattentionLayer # Import from the local file
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
+import torch.optim as optim
+from torch.utils.data import DataLoader, Subset, TensorDataset
 from torchvision.datasets import MNIST
 from torchvision import transforms
 from tqdm import tqdm
@@ -11,333 +11,282 @@ import numpy as np
 import os
 import argparse
 
-# Try to import wandb
-try:
-    import wandb
-    WANDB_AVAILABLE = True
-except ImportError:
-    WANDB_AVAILABLE = False
-    print("wandb not installed. Skipping W&B logging. To install: pip install wandb")
+# Import from your other files
+from vit_pytorch import ContinualLearner, PattentionLayer # CORRECTED IMPORT
+from ipca import IncrementalPCA
 
-### --- CHECKPOINTING FUNCTIONS (Unchanged) --- ###
-def save_checkpoint(state, filename="checkpoint.pth.tar"):
-    print("=> Saving checkpoint")
-    torch.save(state, filename)
-
-def load_checkpoint(model, filename="checkpoint.pth.tar"):
-    if os.path.isfile(filename):
-        print(f"=> Loading checkpoint '{filename}'")
-        checkpoint = torch.load(filename, map_location=DEVICE)
-        
-        start_task_idx = checkpoint['current_task_id'] + 1
-        global_step = checkpoint['global_step']
-        results_history = checkpoint['results_history']
-        
-        if checkpoint['current_task_id'] > 0:
-            print(f"Growing model to saved state (Task {checkpoint['current_task_id']})...")
-            for _ in range(checkpoint['current_task_id']):
-                model.grow()
-
-        model.load_state_dict(checkpoint['model_state_dict'])
-        
-        print(f"=> Loaded checkpoint! Resuming from Task {start_task_idx}")
-        return model, start_task_idx, global_step, results_history, checkpoint.get('optimizer_state_dict')
-    else:
-        print(f"=> No checkpoint found at '{filename}'")
-        return model, 0, 0, {}, None
-
-### --- RESULTS TABLE FUNCTION (Unchanged) --- ###
-def print_results_table(history, num_tasks):
-    print("\n\n--- Final Results Summary ---")
-    header = f"{'After Training Task':<25}"
-    for i in range(num_tasks):
-        header += f"  Task {i} Acc (%) "
-    header += "  Average Acc (%)"
-    print(header)
-    print("-" * len(header))
-    for trained_task_id, accs in history.items():
-        row = f"{f'Task {trained_task_id}':<25}"
-        for i in range(len(accs)):
-            row += f"    {accs[i]:<10.2f}"
-        for i in range(num_tasks - len(accs)):
-            row += f"    {'--':<10}"
-        avg_acc = np.mean(accs)
-        row += f"    {avg_acc:<10.2f}"
-        print(row)
-    print("-" * len(header))
-
-def count_parameters(model, trainable_only=False):
-    if trainable_only:
-        return sum(p.numel() for p in model.parameters() if p.requires_grad)
-    return sum(p.numel() for p in model.parameters())
-
+# --- Helper Functions (from previous script) ---
 def get_split_mnist_loaders(num_tasks, classes_per_task, batch_size):
-    """ Prepares Split MNIST dataloaders using standard torchvision."""
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,)) # Standard MNIST stats
-    ])
-    
+    transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))])
     full_train_dataset = MNIST(root='./data', train=True, download=True, transform=transform)
     full_test_dataset = MNIST(root='./data', train=False, download=True, transform=transform)
-
     train_loaders, test_loaders = [], []
     for task_id in range(num_tasks):
-        start_class = task_id * classes_per_task
-        end_class = (task_id + 1) * classes_per_task
+        start_class, end_class = task_id * classes_per_task, (task_id + 1) * classes_per_task
         task_classes = list(range(start_class, end_class))
-        
-        train_indices = [i for i, label in enumerate(full_train_dataset.targets) if label in task_classes]
-        test_indices = [i for i, label in enumerate(full_test_dataset.targets) if label in task_classes]
-
-        train_subset = Subset(full_train_dataset, train_indices)
-        test_subset = Subset(full_test_dataset, test_indices)
-
-        train_loaders.append(DataLoader(train_subset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True))
-        test_loaders.append(DataLoader(test_subset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True))
-        print(f"Task {task_id}: Classes {task_classes}, Train samples {len(train_subset)}, Test samples {len(test_subset)}")
-        
+        train_indices = [i for i, t in enumerate(full_train_dataset.targets) if t in task_classes]
+        test_indices = [i for i, t in enumerate(full_test_dataset.targets) if t in task_classes]
+        train_loaders.append(DataLoader(Subset(full_train_dataset, train_indices), batch_size=batch_size, shuffle=True))
+        test_loaders.append(DataLoader(Subset(full_test_dataset, test_indices), batch_size=batch_size, shuffle=False))
+        print(f"Task {task_id}: Classes {task_classes}, Train {len(train_indices)}, Test {len(test_indices)}")
     return train_loaders, test_loaders
 
-def evaluate(model, test_loaders, device, num_tasks_seen, classes_per_task):
-    """ Evaluates the model on all tasks seen so far. """
-    model.eval()
-    accuracies = []
-    with torch.no_grad():
-        for task_id in range(num_tasks_seen):
-            correct, total = 0, 0
-            for data, target in test_loaders[task_id]:
-                data, target = data.to(device), target.to(device)
-                # target = target % 2
-                
-                # The model's eval mode produces a single output tensor with scores for all classes
-                output = model(data, task_id=task_id, training=False)
-                
-                # Get the predicted GLOBAL class index
-                _, predicted = torch.max(output.data, 1)
-                
-                total += target.size(0)
-                # Compare the predicted GLOBAL index with the true GLOBAL target
-                correct += (predicted == target).sum().item()
-
-            accuracy = 100 * correct / total
-            accuracies.append(accuracy)
-            print(f"Accuracy on Task {task_id}: {accuracy:.2f}%")
-    return accuracies
-
+# --- Gradient Masking Logic ---
 def apply_grad_mask_hook(grad, mask):
+    """Multiplies gradient by a mask element-wise."""
     return grad * mask
 
-def apply_masks_and_hooks(model, current_task_id, previous_handles):
+def apply_masks_and_hooks(model, previous_handles):
+    """
+    Removes old hooks and applies new ones based on the `grad_mask` buffers
+    in each PattentionLayer. This freezes the parameters for old tasks.
+    """
     for handle in previous_handles:
         handle.remove()
+    
     new_handles = []
     for module in model.growing_transformer.modules():
         if isinstance(module, PattentionLayer):
-            new_handles.append(module.key_param_tokens.register_hook(
-                lambda grad, m=module: apply_grad_mask_hook(grad, m.key_grad_mask)
-            ))
-            new_handles.append(module.value_param_tokens.register_hook(
-                lambda grad, m=module: apply_grad_mask_hook(grad, m.value_grad_mask)
-            ))
+            if module.key_param_tokens.grad is not None:
+                module.key_param_tokens.grad.zero_()
+            new_handles.append(
+                module.key_param_tokens.register_hook(
+                    lambda grad, m=module: apply_grad_mask_hook(grad, m.key_grad_mask)
+                )
+            )
+            
+            if module.value_param_tokens.grad is not None:
+                module.value_param_tokens.grad.zero_()
+            new_handles.append(
+                module.value_param_tokens.register_hook(
+                    lambda grad, m=module: apply_grad_mask_hook(grad, m.value_grad_mask)
+                )
+            )
     return new_handles
 
-def calculate_orthogonality_loss(growing_module):
-    ortho_loss = 0.0
-    num_layers = 0
-    for module in growing_module.modules():
-        if isinstance(module, PattentionLayer) and module.growth_indices:
-            last_growth_idx = module.growth_indices[-1]
-            k_old = module.key_param_tokens[:last_growth_idx]
-            k_new = module.key_param_tokens[last_growth_idx:]
-            v_old = module.value_param_tokens[:last_growth_idx]
-            v_new = module.value_param_tokens[last_growth_idx:]
-
-            if (k_old.numel() > 0 and k_new.numel() > 0) and (v_old.numel() > 0 and v_new.numel() > 0):
-                k_old_norm = F.normalize(k_old, p=2, dim=1)
-                k_new_norm = F.normalize(k_new, p=2, dim=1)
-                v_old_norm = F.normalize(v_old, p=2, dim=1)
-                v_new_norm = F.normalize(v_new, p=2, dim=1)
-                cosine_sim_matrix = torch.matmul(k_old_norm, k_new_norm.T)
-                cosine_sim_matrix_v = torch.matmul(v_old_norm, v_new_norm.T)
-                ortho_loss += (torch.mean(cosine_sim_matrix**2) + torch.mean(cosine_sim_matrix_v**2))
-                num_layers += 1
-    return ortho_loss / num_layers if num_layers > 0 else 0.0
-
-def train_until_plateau(model, current_task_id, train_loader, optimizer, criterion, device,
-                        classes_per_task, global_step, config):
-    model.train()
-    hook_handles = apply_masks_and_hooks(model, current_task_id, [])
+# --- Phase 1: Train Backbone and Learn Distributions ---
+def train_phase_1(config, device):
+    print("--- Starting Phase 1: Training Backbone and Learning Class Distributions ---")
     
-    patience = config["patience"]
-    min_delta = config["min_delta_loss"]
-    lambda_max = config["lambda_max"]
-    lambda_min = config["lambda_min"]
-    bonus_max = config["attention_bonus_max"]
-    lambda_decay_epochs = config["lambda_decay_epochs"]
+    # Setup model, data, and optimizer
+    model = ContinualLearner(
+        image_size=config['image_size'], dim=config['dim'], depth=config['depth'],
+        heads=config['heads'], mlp_dim=config['mlp_dim'], num_tasks=config['num_tasks'],
+        classes_per_task=config['classes_per_task'], device=device
+    ).to(device)
+    train_loaders, _ = get_split_mnist_loaders(config['num_tasks'], config['classes_per_task'], config['batch_size'])
+    criterion = nn.CrossEntropyLoss()
     
-    patience_counter = 0
-    best_loss = float('inf')
-    epoch = 0
+    ipca_models = {} # Dictionary to store one IncrementalPCA model per class
+    hook_handles = [] # To store hook handles
 
-    print(f"🚀 Starting training for model task {current_task_id} (patience={patience}, lambda: {lambda_max} -> {lambda_min}).")
-    while patience_counter < patience:
-        loop = tqdm(train_loader, leave=True)
-        epoch_loss = 0.0
-        num_batches = 0
-        decay_factor = max(0, (1 - epoch / lambda_decay_epochs))
-        current_attention_bonus = bonus_max * decay_factor
-        current_lambda = lambda_max
-
-        for batch_idx, (data, target) in enumerate(loop):
-            data, target = data.to(device), target.to(device)
-            # Make targets relative to the current task (e.g., classes {2, 3} -> {0, 1})
-            target = target - current_task_id * classes_per_task
-            
-            optimizer.zero_grad(set_to_none=True)
-            
-            # Model returns logits for the current task head
-            output = model(data, current_task_id, current_attention_bonus=current_attention_bonus, training=True)
-            task_loss = criterion(output, target)
-
-            ortho_loss = 0.0
-            # if current_task_id > 0:
-            #     ortho_loss = calculate_orthogonality_loss(model.growing_transformer)
-            
-            # total_loss = task_loss + current_lambda * ortho_loss
-            total_loss = task_loss
-            total_loss.backward()
-            optimizer.step()
-
-            epoch_loss += total_loss.item()
-            num_batches += 1
-            global_step += 1
-            
-            if WANDB_AVAILABLE:
-                log_data = {
-                    "task_loss": task_loss.item(), "total_loss": total_loss.item(),
-                    "model_task_id": current_task_id, "epoch": epoch, "global_step": global_step,
-                    "current_lambda": current_lambda
-                }
-                if current_task_id > 0:
-                    log_data["ortho_loss"] = ortho_loss.item() if isinstance(ortho_loss, torch.Tensor) else ortho_loss
-                wandb.log(log_data)
-                
-            loop.set_description(f"Data Task {config['data_task_idx']} | Model Task {current_task_id} | Epoch {epoch+1}")
-            loop.set_postfix(loss=total_loss.item(), ortho=f"{ortho_loss.item() if isinstance(ortho_loss, torch.Tensor) else 0:.4f}")
-
-        avg_epoch_loss = epoch_loss / num_batches if num_batches > 0 else float('inf')
-        print(f"\nEpoch {epoch+1} ended. Avg Total Loss: {avg_epoch_loss:.4f}. Best Loss: {best_loss:.4f}")
+    for task_id in range(config['num_tasks']):
+        print(f"\nTraining on Task {task_id}...")
+        if task_id > 0:
+            model.grow()
         
-        if avg_epoch_loss < best_loss - min_delta:
-            best_loss = avg_epoch_loss
-            patience_counter = 0
-            print(f"✅ Loss improved. Resetting patience counter.")
-        else:
-            patience_counter += 1
-            print(f"⚠️ Loss did not improve. Patience: {patience_counter}/{patience}")
+        optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=config['lr'])
+        hook_handles = apply_masks_and_hooks(model, hook_handles)
+
+        model.train()
+        for epoch in range(config['epochs_per_task']):
+            epoch_loss = 0.0
+            loop = tqdm(train_loaders[task_id], desc=f"Task {task_id} Epoch {epoch+1}", leave=False)
+            for data, target in loop:
+                data, target = data.to(device), target.to(device)
+                target_local = target - task_id * config['classes_per_task']
+                
+                optimizer.zero_grad()
+                output = model(data, task_id, training=True)
+                loss = criterion(output, target_local)
+                loss.backward()
+                optimizer.step()
+                
+                epoch_loss += loss.item()
+                loop.set_postfix(loss=loss.item())
             
-        epoch += 1
-        if patience_counter >= patience:
-            break
+            avg_epoch_loss = epoch_loss / len(train_loaders[task_id])
+            print(f"Task {task_id} Epoch {epoch+1} Average Loss: {avg_epoch_loss:.4f}")
+        
+        print(f"Finished training on Task {task_id}. Now fitting distributions...")
+        
+        model.eval()
+        with torch.no_grad():
+            all_features, all_labels = [], []
+            for data, target in train_loaders[task_id]:
+                data = data.to(device)
+                features = model.forward_features(data)
+                all_features.append(features.cpu())
+                all_labels.append(target.cpu())
             
-    print(f"🏁 Loss plateaued after {epoch} epochs.")
+            all_features = torch.cat(all_features)
+            all_labels = torch.cat(all_labels)
+
+            start_class = task_id * config['classes_per_task']
+            end_class = (task_id + 1) * config['classes_per_task']
+            for class_idx in range(start_class, end_class):
+                class_features = all_features[all_labels == class_idx]
+                if class_idx not in ipca_models:
+                    ipca_models[class_idx] = IncrementalPCA(n_components=config['ipca_components'], device='cpu')
+                ipca_models[class_idx].update(class_features)
+                print(f"Updated iPCA for class {class_idx} with {len(class_features)} samples.")
+
     for handle in hook_handles:
         handle.remove()
-    return optimizer, global_step
+
+    torch.save(model.state_dict(), config['backbone_path'])
+    ipca_states = {k: v.state_dict() for k, v in ipca_models.items()}
+    torch.save(ipca_states, config['ipca_path'])
+    print(f"\nPhase 1 complete. Backbone saved to {config['backbone_path']}")
+    print(f"iPCA models saved to {config['ipca_path']}")
+
+
+# --- Phase 2: Train Final Classifier on Synthetic Data ---
+def train_phase_2(config, device):
+    print("\n--- Starting Phase 2: Training Final Classifier on Synthetic Features ---")
+    
+    ipca_states = torch.load(config['ipca_path'])
+    ipca_models = {}
+    for class_idx, state_dict in ipca_states.items():
+        model = IncrementalPCA(n_components=state_dict['n_components'], device=device)
+        model.load_state_dict(state_dict)
+        ipca_models[class_idx] = model
+    print(f"Loaded {len(ipca_models)} iPCA models.")
+
+    synthetic_features, synthetic_labels = [], []
+    for class_idx, ipca_model in ipca_models.items():
+        samples = ipca_model.sample(config['samples_per_class'])
+        synthetic_features.append(samples)
+        synthetic_labels.append(torch.full((config['samples_per_class'],), class_idx, dtype=torch.long, device=device))
+
+    synthetic_dataset = TensorDataset(torch.cat(synthetic_features), torch.cat(synthetic_labels))
+    synthetic_loader = DataLoader(synthetic_dataset, batch_size=config['batch_size'], shuffle=True)
+    
+    # The final classifier now predicts one of the N tasks
+    final_classifier = nn.Linear(config['dim'], config['num_tasks']).to(device)
+    optimizer = optim.Adam(final_classifier.parameters(), lr=config['lr'])
+    criterion = nn.CrossEntropyLoss()
+
+    print("Training final task-level classifier (Router)...")
+    final_classifier.train()
+    for epoch in range(config['final_classifier_epochs']):
+        total_loss = 0
+        for features, labels in tqdm(synthetic_loader, desc=f"Phase 2 Epoch {epoch+1}"):
+            optimizer.zero_grad()
+            features = features.to(device)
+            
+            # --- CORRECTED: Train with task labels, not class labels ---
+            # The classifier predicts a task ID, so the label must be a task ID.
+            task_labels = labels // config['classes_per_task']
+            
+            outputs = final_classifier(features)
+            # print(outputs, task_labels)
+            
+            loss = criterion(outputs, task_labels)
+            # --- END CORRECTION ---
+
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        print(f"Epoch {epoch+1}, Avg Loss: {total_loss / len(synthetic_loader):.4f}")
+        print(torch.argmax(outputs, dim=1), task_labels)
+
+    torch.save(final_classifier.state_dict(), config['classifier_path'])
+    print(f"Phase 2 complete. Final classifier saved to {config['classifier_path']}")
+
+# --- Evaluation ---
+def evaluate(config, device):
+    print("\n--- Starting Evaluation on Real Test Data ---")
+    
+    backbone = ContinualLearner(
+        image_size=config['image_size'], dim=config['dim'], depth=config['depth'],
+        heads=config['heads'], mlp_dim=config['mlp_dim'], num_tasks=config['num_tasks'],
+        classes_per_task=config['classes_per_task'], device=device
+    ).to(device)
+    for _ in range(config['num_tasks'] - 1): backbone.grow()
+    backbone.load_state_dict(torch.load(config['backbone_path'], map_location=device))
+    backbone.eval()
+
+    final_classifier = nn.Linear(config['dim'], config['num_tasks']).to(device)
+    final_classifier.load_state_dict(torch.load(config['classifier_path'], map_location=device))
+    final_classifier.eval()
+
+    _, test_loaders = get_split_mnist_loaders(config['num_tasks'], config['classes_per_task'], config['batch_size'])
+    full_test_loader = DataLoader(torch.utils.data.ConcatDataset([dl.dataset for dl in test_loaders]), batch_size=config['batch_size'])
+
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for data, target in tqdm(full_test_loader, desc="Evaluating"):
+            data, target = data.to(device), target.to(device)
+            
+            # --- COMPLETED: Two-stage prediction logic ---
+            # 1. Get features from the backbone
+            features = backbone.forward_features(data)
+            
+            # 2. Use the final classifier as a "Router" to predict the task
+            task_logits = final_classifier(features)
+            predicted_task_ids = torch.argmax(task_logits, dim=1)
+            
+            # 3. Use the predicted task to select the correct "Expert" head and get final class prediction
+            batch_size = data.shape[0]
+            final_predictions = torch.zeros_like(target)
+            for i in range(batch_size):
+                task_id = predicted_task_ids[i].item()
+                feature_sample = features[i].unsqueeze(0) # Add batch dim for the head
+                
+                # Select the expert head
+                expert_head = backbone.mlp_heads[task_id]
+                
+                # Get local class logits (e.g., for classes {6,7}, logits for {0,1})
+                local_logits = expert_head(feature_sample)
+                local_prediction = torch.argmax(local_logits, dim=1).item()
+
+                # print(local_prediction, task_id, target[i])
+                
+                # Convert local prediction to global class ID
+                global_prediction = task_id * config['classes_per_task'] + local_prediction
+                final_predictions[i] = global_prediction
+
+            total += target.size(0)
+            correct += (final_predictions == target).sum().item()
+            # --- END COMPLETION ---
+
+    accuracy = 100 * correct / total
+    print(f"\nFinal CIL Accuracy on the entire test set: {accuracy:.2f}%")
+    return accuracy
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Tokenformer Continual Learning on MNIST')
-    parser.add_argument('--resume', default='', type=str, metavar='PATH',
-                        help='path to latest checkpoint (default: none)')
+    parser = argparse.ArgumentParser(description='Tokenformer with Incremental PCA for CIL')
+    parser.add_argument('--phase', required=True, type=str, choices=['1', '2', 'eval', 'all'],
+                        help="Which part of the process to run: '1' for backbone training, "
+                             "'2' for final classifier training, 'eval' for evaluation, or 'all' to run sequentially.")
     args = parser.parse_args()
 
     config = {
-        "num_tasks": 5,
-        "classes_per_task": 2,
-        "batch_size": 64,
-        "patience": 2,
-        "min_delta_loss": 0.01,
-        "lr": 1e-4,
-        "lambda_max": 10.0,
-        "lambda_min": 0.01,
-        "lambda_decay_epochs": 4,
-        "attention_bonus_max": 0.0,
-        "data_task_idx": 0,
+        # Model HParams
+        "image_size": 28, "dim": 128, "depth": 2, "heads": 4, "mlp_dim": 256,
+        # CL HParams
+        "num_tasks": 5, "classes_per_task": 2,
+        # Training HParams
+        "batch_size": 128, "lr": 1e-4, "epochs_per_task": 3, "final_classifier_epochs": 20,
+        # iPCA HParams
+        "ipca_components": 20, "samples_per_class": 1000,
+        # File Paths
+        "backbone_path": "checkpoints/backbone_final.pth",
+        "ipca_path": "checkpoints/ipca_models.pth",
+        "classifier_path": "checkpoints/final_classifier.pth",
     }
-    # DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
-    print("DEVICE:", DEVICE)
-    if WANDB_AVAILABLE:
-        wandb.init(project="tokenformer-mnist-cl-simplified", config=config)
-
-    model = ContinualLearner(
-        image_size=28,
-        dim=128, 
-        depth=2, 
-        heads=4, 
-        mlp_dim=256,
-        num_tasks=config["num_tasks"], 
-        classes_per_task=config["classes_per_task"],
-        device=DEVICE,
-        attention_bonus_max=config["attention_bonus_max"],
-    ).to(DEVICE)
     
-    train_loaders, test_loaders = get_split_mnist_loaders(config["num_tasks"], config["classes_per_task"], config["batch_size"])
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=config["lr"])
+    DEVICE = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+    print(f"Using device: {DEVICE}")
+    os.makedirs("checkpoints", exist_ok=True)
+
+    if args.phase == '1' or args.phase == 'all':
+        train_phase_1(config, DEVICE)
     
-    start_task_idx = 0
-    global_step = 0
-    current_task_id = 0
-    results_history = {}
-
-    if args.resume:
-        model, start_task_idx, global_step, results_history, optimizer_state_dict = load_checkpoint(model, args.resume)
-        if optimizer_state_dict:
-            optimizer.load_state_dict(optimizer_state_dict)
-        current_task_id = start_task_idx - 1 if start_task_idx > 0 else 0
-    
-    print(f"Total model parameters: {count_parameters(model):,}")
-    print(f"Trainable parameters: {count_parameters(model, trainable_only=True):,}")
-
-    for data_task_idx in range(start_task_idx, config["num_tasks"]):
-        print(f"\n--- Presenting Data from Task {data_task_idx} (Model is on Task {current_task_id}) ---")
-        config["data_task_idx"] = data_task_idx
-
-        if data_task_idx > current_task_id and data_task_idx > 0:
-             current_task_id += 1
-             model.grow()
-             print(f"Trainable parameters after growth: {count_parameters(model, trainable_only=True):,}")
-             # Re-initialize optimizer to include new parameters from growth
-             optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=config["lr"])
-             if WANDB_AVAILABLE:
-                 wandb.log({"growth_event": 1, "model_task_id": current_task_id, "global_step": global_step, "trainable_parameters": count_parameters(model, trainable_only=True)})
+    if args.phase == '2' or args.phase == 'all':
+        train_phase_2(config, DEVICE)
         
-        optimizer, global_step = train_until_plateau(
-            model, current_task_id, train_loaders[data_task_idx], optimizer, criterion, DEVICE, 
-            config["classes_per_task"], global_step, config
-        )
-        
-        print(f"--- Finished Training on Data Task {data_task_idx} ---")
-        accuracies = evaluate(model, test_loaders, DEVICE, current_task_id + 1, config["classes_per_task"])
-        
-        results_history[current_task_id] = accuracies
-        
-        state_to_save = {
-            'current_task_id': current_task_id,
-            'global_step': global_step,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'results_history': results_history,
-        }
-        save_checkpoint(state_to_save, filename=f"checkpoint_task_{current_task_id}_final.pth.tar")
-
-    print_results_table(results_history, config["num_tasks"])
-
-    if WANDB_AVAILABLE:
-        final_accs = results_history.get(config["num_tasks"] - 1, [0])
-        if final_accs:
-            wandb.summary["final_average_accuracy"] = np.mean(final_accs)
-        wandb.summary["final_trainable_parameters"] = count_parameters(model, trainable_only=True)
-        wandb.finish()
+    if args.phase == 'eval' or args.phase == 'all':
+        evaluate(config, DEVICE)
