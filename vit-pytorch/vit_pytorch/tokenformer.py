@@ -1,203 +1,153 @@
-# tokenformer.py
-
+# model.py
 import torch
 from torch import nn
 import torch.nn.functional as F
-from einops import rearrange
+# from DG_layer import SparseImageAutoencoder # <-- Import the new autoencoder
+
+class SparseImageAutoencoder(nn.Module):
+    """
+    An autoencoder that takes an image, maps it to a large, sparse latent space
+    using a k-Winners-Take-All mechanism, and reconstructs the original image.
+    """
+    def __init__(self, image_size=28, channels=1, latent_dim=1024, k=50):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.k = int(k)
+        
+        # Encoder: Converts the image to a latent vector
+        self.encoder = nn.Sequential(
+            nn.Conv2d(channels, 32, kernel_size=4, stride=2, padding=1), # -> 14x14
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1), # -> 7x7
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(64 * 7 * 7, latent_dim)
+        )
+        
+        # Decoder: Reconstructs the image from the latent vector
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, 64 * 7 * 7),
+            nn.ReLU(),
+            nn.Unflatten(1, (64, 7, 7)),
+            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1), # -> 14x14
+            nn.ReLU(),
+            nn.ConvTranspose2d(32, channels, kernel_size=4, stride=2, padding=1), # -> 28x28
+            nn.Sigmoid() # Use Sigmoid to ensure output pixels are between 0 and 1
+        )
+
+    def k_winner_take_all(self, x):
+        """Applies k-Winners-Take-All activation to the latent vector."""
+        if self.k >= self.latent_dim:
+            return x
+        
+        top_k_values, top_k_indices = torch.topk(x, self.k, dim=-1)
+        mask = torch.zeros_like(x)
+        mask.scatter_(-1, top_k_indices, 1)
+        return x * mask
+
+    def encode(self, img):
+        """
+        Encodes an image to its sparse latent representation.
+        This is the method that will be used by the ContinualLearner.
+        """
+        latent_vector = self.encoder(img)
+        sparse_latent_vector = self.k_winner_take_all(latent_vector)
+        return sparse_latent_vector
+
+    def forward(self, img):
+        """
+        Performs a full autoencoder pass: encode -> decode.
+        This is used during the pre-training phase.
+        """
+        sparse_latent_vector = self.encode(img)
+        reconstructed_img = self.decoder(sparse_latent_vector)
+        return reconstructed_img
+
 
 class PattentionLayer(nn.Module):
-    def __init__(self, dim_in, dim_out, num_param_tokens, device='cpu'):
+    # (This class is unchanged)
+    def __init__(self, dim_in, dim_out, num_initial_tokens, device='cpu'):
         super().__init__()
-        self.scale = dim_in ** -0.5
         self.device = device
-        if num_param_tokens == 0:
-            self.key_param_tokens = nn.Parameter(torch.empty(0, dim_in, device=self.device))
-            self.value_param_tokens = nn.Parameter(torch.empty(0, dim_out, device=self.device))
-        else:
-            self.key_param_tokens = nn.Parameter(torch.randn(num_param_tokens, dim_in, device=self.device))
-            self.value_param_tokens = nn.Parameter(torch.randn(num_param_tokens, dim_out, device=self.device))
-        self.register_buffer('key_grad_mask', torch.ones_like(self.key_param_tokens))
-        self.register_buffer('value_grad_mask', torch.ones_like(self.value_param_tokens))
-        self.growth_indices = []
-        self.attn_weights = None
+        self.key_param_tokens = nn.Parameter(torch.randn(num_initial_tokens, dim_in))
+        self.value_param_tokens = nn.Parameter(torch.randn(num_initial_tokens, dim_out))
+        self.register_buffer('grad_mask', torch.ones(num_initial_tokens, 1, device=device))
+        self.growth_indices = [0]
 
-    def forward(self, x, task_id=-1, attention_bonus=0.0, training=True, top_k=32): # Added top_k
-        if self.key_param_tokens.shape[0] == 0:
+    def forward(self, x):
+        num_total_tokens = self.key_param_tokens.shape[0]
+        if num_total_tokens == 0:
             return torch.zeros(x.shape[:-1] + (self.value_param_tokens.shape[1],), device=self.device)
-
-        similarity = torch.matmul(x, self.key_param_tokens.T) * self.scale
-        if training and task_id > 0 and attention_bonus > 0:
-            bonus = torch.zeros_like(similarity)
-            boundaries = [0] + self.growth_indices + [self.key_param_tokens.shape[0]]
-            
-            if task_id < len(boundaries) - 1:
-                start_idx, end_idx = boundaries[task_id], boundaries[task_id + 1]
-                if len(similarity.shape) == 3:
-                    bonus[:, :, start_idx:end_idx] += attention_bonus
-                else:
-                    bonus[:, start_idx:end_idx] += attention_bonus
-                similarity = similarity + bonus
-            
+        similarity = torch.matmul(x, self.key_param_tokens.T)
         norm_similarity = F.normalize(similarity, p=2, dim=-1)
         attn_weights = F.gelu(norm_similarity)
-        
-        # --- NEW: TOP-K GATING LOGIC FOR INFERENCE ---
-        if not training and top_k is not None and top_k < attn_weights.shape[-1]:
-            # Use absolute values to find the strongest signals (positive or negative)
-            abs_attn_weights = torch.abs(attn_weights)
-            
-            # Get the top K values and their indices
-            _, top_k_indices = torch.topk(abs_attn_weights, k=top_k, dim=-1)
-            
-            # Create a mask of zeros and scatter ones at the top-k positions
-            mask = torch.zeros_like(attn_weights)
-            mask.scatter_(-1, top_k_indices, 1.0)
-            
-            # Apply the mask to keep only the top-k weights
-            attn_weights = attn_weights * mask
-        # --- END NEW LOGIC ---
-
-        self.attn_weights = attn_weights
-        out = torch.matmul(attn_weights, self.value_param_tokens)
-        return out
+        return torch.matmul(attn_weights, self.value_param_tokens)
 
     def grow(self, num_new_tokens):
-        # This method is unchanged
+        device = self.key_param_tokens.device
         dim_in, dim_out = self.key_param_tokens.shape[1], self.value_param_tokens.shape[1]
-        if self.key_param_tokens.numel() == 0:
-            new_key_tokens = torch.randn(num_new_tokens, dim_in, device=self.device)
-            new_value_tokens = torch.randn(num_new_tokens, dim_out, device=self.device)
-        else:
-            old_keys, old_values = self.key_param_tokens.data, self.value_param_tokens.data
-            random_indices = torch.randint(0, old_keys.shape[0], (num_new_tokens,), device=self.device)
-            base_new_keys, base_new_values = old_keys[random_indices], old_values[random_indices]
-            noise_k, noise_v = torch.randn_like(base_new_keys) * 0.01, torch.randn_like(base_new_values) * 0.01
-            new_key_tokens, new_value_tokens = base_new_keys + noise_k, base_new_values + noise_v
-            avg_key_norm = torch.mean(torch.norm(old_keys, p=2, dim=1))
-            avg_value_norm = torch.mean(torch.norm(old_values, p=2, dim=1))
-            new_key_tokens = F.normalize(new_key_tokens, p=2, dim=1) * avg_key_norm
-            new_value_tokens = F.normalize(new_value_tokens, p=2, dim=1) * avg_value_norm
-        self.growth_indices.append(self.key_param_tokens.shape[0])
-        self.key_grad_mask.fill_(0)
-        self.value_grad_mask.fill_(0)
-        new_key_mask, new_value_mask = torch.ones_like(new_key_tokens), torch.ones_like(new_value_tokens)
-        self.key_param_tokens = nn.Parameter(torch.cat([self.key_param_tokens.data, new_key_tokens], dim=0))
-        self.value_param_tokens = nn.Parameter(torch.cat([self.value_param_tokens.data, new_value_tokens], dim=0))
-        self.key_grad_mask = torch.cat([self.key_grad_mask, new_key_mask], dim=0)
-        self.value_grad_mask = torch.cat([self.value_grad_mask, new_value_mask], dim=0)
+        old_keys, old_values = self.key_param_tokens.data, self.value_param_tokens.data
+        random_indices = torch.randint(0, old_keys.shape[0], (num_new_tokens,), device=device)
+        base_new_keys = old_keys[random_indices] + torch.randn(num_new_tokens, dim_in, device=device) * 0.01
+        base_new_values = old_values[random_indices] + torch.randn(num_new_tokens, dim_out, device=device) * 0.01
+        self.grad_mask.fill_(0)
+        new_mask = torch.ones(num_new_tokens, 1, device=device)
+        self.key_param_tokens = nn.Parameter(torch.cat([old_keys, base_new_keys], dim=0))
+        self.value_param_tokens = nn.Parameter(torch.cat([old_values, base_new_values], dim=0))
+        self.grad_mask = torch.cat([self.grad_mask.data, new_mask], dim=0)
+        self.growth_indices.append(old_keys.shape[0])
 
-class TokenformerFeedForward(nn.Module):
-    def __init__(self, dim, hidden_dim, ffn_num_param_tokens, dropout = 0., device='cpu'):
-        super().__init__()
-        self.layer_norm = nn.LayerNorm(dim)
-        self.pattn1 = PattentionLayer(dim, hidden_dim, num_param_tokens=ffn_num_param_tokens, device=device)
-        self.gelu = nn.GELU()
-        self.dropout1 = nn.Dropout(dropout)
-        self.pattn2 = PattentionLayer(hidden_dim, dim, num_param_tokens=ffn_num_param_tokens, device=device)
-        self.dropout2 = nn.Dropout(dropout)
-        
-    def forward(self, x, task_id=-1, attention_bonus=0.0, training=True):
-        x_norm = self.layer_norm(x)
-        x_res = x
-        x = self.pattn1(x_norm, task_id, attention_bonus, training)
-        x = self.gelu(x)
-        x = self.dropout1(x)
-        x = self.pattn2(x, task_id, attention_bonus, training)
-        x = self.dropout2(x)
-        return x + x_res
-
-class TokenformerAttention(nn.Module):
-    def __init__(self, dim, heads = 8, dim_head = 64, attn_num_param_tokens=None, dropout = 0., device='cpu'):
-        super().__init__()
-        inner_dim = dim_head * heads
-        project_out = not (heads == 1 and dim_head == dim)
-        self.heads = heads
-        self.scale = dim_head ** -0.5
-        self.norm = nn.LayerNorm(dim)
-        self.attend = nn.Softmax(dim = -1)
-        self.dropout = nn.Dropout(dropout)
-        if attn_num_param_tokens is None: attn_num_param_tokens = inner_dim
-        self.to_q = PattentionLayer(dim, inner_dim, num_param_tokens=attn_num_param_tokens, device=device)
-        self.to_k = PattentionLayer(dim, inner_dim, num_param_tokens=attn_num_param_tokens, device=device)
-        self.to_v = PattentionLayer(dim, inner_dim, num_param_tokens=attn_num_param_tokens, device=device)
-        self.to_out = PattentionLayer(inner_dim, dim, num_param_tokens=attn_num_param_tokens, device=device) if project_out else nn.Identity()
-
-    def forward(self, x, task_id=-1, attention_bonus=0.0, training=True):
-        x_norm = self.norm(x)
-        x_res = x
-        q = self.to_q(x_norm, task_id, attention_bonus, training)
-        k = self.to_k(x_norm, task_id, attention_bonus, training)
-        v = self.to_v(x_norm, task_id, attention_bonus, training)
-        if q.shape[1] == 0: return torch.zeros_like(x)
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=self.heads), (q, k, v))
-        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
-        attn = self.attend(dots)
-        attn = self.dropout(attn)
-        out = torch.matmul(attn, v)
-        out = rearrange(out, 'b h n d -> b n (h d)')
-        return self.to_out(out, task_id, attention_bonus, training) + x_res
 
 class TokenformerEncoder(nn.Module):
-    def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout = 0., device='cpu'):
+    # (This class is unchanged)
+    def __init__(self, dim, depth, num_initial_tokens, device):
         super().__init__()
         self.layers = nn.ModuleList([])
         for _ in range(depth):
             self.layers.append(nn.ModuleList([
-                TokenformerAttention(dim, heads=heads, dim_head=dim_head, attn_num_param_tokens=dim, dropout=dropout, device=device),
-                TokenformerFeedForward(dim, mlp_dim, ffn_num_param_tokens=mlp_dim, dropout=dropout, device=device)
+                PattentionLayer(dim, dim, num_initial_tokens, device),
+                nn.LayerNorm(dim),
             ]))
-        self.norm = nn.LayerNorm(dim)
-
-    def forward(self, x, task_id=-1, attention_bonus=0.0, training=True):
-        for attn, ff in self.layers:
-            x = attn(x, task_id=task_id, attention_bonus=attention_bonus, training=training)
-            x = ff(x, task_id=task_id, attention_bonus=attention_bonus, training=training)
-        return self.norm(x)
+    def forward(self, x):
+        for attn, norm in self.layers:
+            x = attn(x) + x
+            x = norm(x)
+        return x
 
 class ContinualLearner(nn.Module):
-    def __init__(self, *, image_size, dim, depth, heads, mlp_dim, num_tasks, classes_per_task,
-                 channels=1, device='cpu', attention_bonus_max=0.0):
+    def __init__(self, *, image_size, depth,
+                 num_initial_tokens, latent_dim, dg_k, num_total_classes,
+                 channels=1, device='cpu'):
         super().__init__()
-        self.attention_bonus_max = attention_bonus_max
-        self.num_tasks = num_tasks
-        self.classes_per_task = classes_per_task
-        self.device = device
-        self.dim = dim
-        input_dim = channels * image_size * image_size
-        self.input_projection = nn.Linear(input_dim, dim)
-        self.growing_transformer = TokenformerEncoder(
-            dim=dim, depth=depth, heads=heads, dim_head=dim, mlp_dim=mlp_dim, device=device
-        )
-        self.mlp_heads = nn.ModuleList([
-            nn.Linear(dim, classes_per_task) for _ in range(num_tasks)
-        ])
         
-    def forward_features(self, img):
-        img_flat = rearrange(img, 'b c h w -> b (c h w)')
-        tokens = self.input_projection(img_flat).unsqueeze(1)
-        output_sequence = self.growing_transformer(tokens, task_id=-1, training=False)
-        return output_sequence[:, 0]
+        # --- MODIFIED: The feature extractor is now the pre-trained autoencoder ---
+        self.feature_extractor = SparseImageAutoencoder(
+            image_size=image_size,
+            channels=channels,
+            latent_dim=latent_dim,
+            k=dg_k
+        )
+        
+        # The transformer now takes the latent vector as input
+        self.transformer = TokenformerEncoder(latent_dim, depth, num_initial_tokens, device)
+        self.output_head = nn.Linear(latent_dim, num_total_classes)
 
-    def forward(self, img, task_id, training=True, current_attention_bonus=0.0):
-        img_flat = rearrange(img, 'b c h w -> b (c h w)')
-        tokens = self.input_projection(img_flat).unsqueeze(1)
-        output_sequence = self.growing_transformer(tokens, task_id, current_attention_bonus, training=training)
-        output_token = output_sequence[:, 0]
+    def forward(self, img):
+        # 1. Get the sparse latent vector from the frozen autoencoder's encoder
+        with torch.no_grad(): # Ensure feature extractor is not trained
+            sparse_latent_vector = self.feature_extractor.encode(img)
+        
+        # 2. Add a sequence dimension for the transformer
+        x = sparse_latent_vector.unsqueeze(1)
+        
+        # 3. Process through the transformer
+        x = self.transformer(x)
+        
+        # 4. Get final features and classify
+        features = x.squeeze(1)
+        return self.output_head(features)
 
-        if training:
-            return self.mlp_heads[task_id](output_token)
-        else:
-            # For task-aware eval or final CIL eval, this part might be handled outside
-            outputs = []
-            for t in range(self.num_tasks):
-                out = self.mlp_heads[t](output_token)
-                outputs.append(out)
-            return torch.cat(outputs, dim=1)
-
-    def grow(self):
-        print("\n--- Growing Model (Tokenformer Encoder) ---")
-        new_tokens_per_layer = 32 # As specified
-        for module in self.growing_transformer.modules():
+    def grow_transformer(self, num_new_tokens):
+        for module in self.transformer.modules():
             if isinstance(module, PattentionLayer):
-                module.grow(new_tokens_per_layer)
-        print("--- Model Growth Complete ---")
+                module.grow(num_new_tokens)
