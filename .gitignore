@@ -3,3 +3,5 @@ env/
 wandb/
 *.pyc
 *.png
+*.pth
+*.tar
